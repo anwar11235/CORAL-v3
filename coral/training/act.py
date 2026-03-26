@@ -92,10 +92,11 @@ class CoralACT(nn.Module):
             ACTCarry with halted=True for every sequence.
         """
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
         return ACTCarry(
-            inner_carry=self.inner.empty_carry(batch_size),
-            steps=torch.zeros(batch_size, dtype=torch.int32),
-            halted=torch.ones(batch_size, dtype=torch.bool),
+            inner_carry=self.inner.empty_carry(batch_size, device=device),
+            steps=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            halted=torch.ones(batch_size, dtype=torch.bool, device=device),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 

@@ -235,16 +235,16 @@ class CoralInner(nn.Module):
 
         return self.embed_scale * embedding
 
-    def empty_carry(self, batch_size: int) -> InnerCarry:
+    def empty_carry(self, batch_size: int, device: torch.device = None) -> InnerCarry:
         """Allocate an uninitialised carry (will be reset on first segment)."""
         return InnerCarry(
             z_H=torch.empty(
                 batch_size, self.total_seq_len, self.config.hidden_size,
-                dtype=self.forward_dtype,
+                dtype=self.forward_dtype, device=device,
             ),
             z_L=torch.empty(
                 batch_size, self.total_seq_len, self.config.hidden_size,
-                dtype=self.forward_dtype,
+                dtype=self.forward_dtype, device=device,
             ),
         )
 
