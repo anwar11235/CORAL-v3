@@ -180,24 +180,30 @@ class TestCoralACTForward:
     def test_carry_reset_for_halted(self):
         """Halted sequences should receive fresh batch data; non-halted keep their carry."""
         model, carry = self._model_and_carry()
-        batch = make_batch(device="cuda")
+
+        # Two distinct batches so comparisons are unambiguous.
+        # batch_old: all VOCAB-1 (the "stale" data sitting in current_data)
+        # batch_new: random values (the "fresh" data we feed in)
+        batch_old = make_batch(device="cuda")
+        batch_old["inputs"][:] = VOCAB - 1
+        batch_new = make_batch(device="cuda")
+
+        # Seed current_data with batch_old values
+        carry.current_data["inputs"][:] = VOCAB - 1
 
         # Mark only first half as halted
         carry.halted[:] = False
         carry.halted[:BATCH // 2] = True
 
-        # Poison the current_data with a distinguishable value
-        carry.current_data["inputs"][:] = VOCAB - 1
+        new_carry, _ = model(carry, batch_new)
 
-        new_carry, _ = model(carry, batch)
-
-        # Halted sequences should have batch["inputs"] in their carry data
+        # Halted sequences (0..BATCH//2) should now carry batch_new inputs
         torch.testing.assert_close(
             new_carry.current_data["inputs"][:BATCH // 2],
-            batch["inputs"][:BATCH // 2],
+            batch_new["inputs"][:BATCH // 2],
         )
-        # Non-halted sequences keep old data (99)
-        assert (new_carry.current_data["inputs"][BATCH // 2:] == 99).all()
+        # Non-halted sequences (BATCH//2..) should retain the old VOCAB-1 values
+        assert (new_carry.current_data["inputs"][BATCH // 2:] == VOCAB - 1).all()
 
     def test_steps_increment(self):
         """Steps should increment by 1 each call; halted sequences reset to 1."""
