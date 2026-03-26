@@ -1,0 +1,23 @@
+# Core
+torch>=2.0
+numpy>=1.24
+
+# Attention kernel (CUDA only — install separately on GPU machines)
+# pip install flash-attn>=2.0 --no-build-isolation
+# For Hopper GPUs (H100): pip install flash-attn-interface
+
+# Optimizer
+adam-atan2>=0.1
+
+# Config / CLI
+pydantic>=2.0
+hydra-core>=1.3
+omegaconf>=2.3
+
+# Logging
+wandb>=0.16
+
+# Utilities
+tqdm>=4.0
+einops>=0.7
+coolname>=2.2

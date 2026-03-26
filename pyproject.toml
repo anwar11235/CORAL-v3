@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "coral"
+version = "0.1.0"
+description = "CORAL v3 — COrtical Reasoning via Abstraction Layers"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "adam-atan2>=0.1",
+    "pydantic>=2.0",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "wandb>=0.16",
+    "tqdm>=4.0",
+    "einops>=0.7",
+    "coolname>=2.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["coral*"]
