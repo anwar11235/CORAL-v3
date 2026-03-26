@@ -59,6 +59,7 @@ def make_batch(B=BATCH, seq=SEQ_LEN, vocab=VOCAB, device="cpu"):
     return {
         "inputs": torch.randint(0, vocab, (B, seq), device=device),
         "labels": torch.randint(0, vocab, (B, seq), device=device),
+        "puzzle_identifiers": torch.zeros(B, dtype=torch.int32, device=device),
     }
 
 
@@ -186,7 +187,7 @@ class TestCoralACTForward:
         carry.halted[:BATCH // 2] = True
 
         # Poison the current_data with a distinguishable value
-        carry.current_data["inputs"][:] = 99
+        carry.current_data["inputs"][:] = VOCAB - 1
 
         new_carry, _ = model(carry, batch)
 
