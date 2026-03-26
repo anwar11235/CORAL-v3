@@ -27,9 +27,9 @@ from coral.training.scheduler import cosine_schedule_with_warmup_lr_lambda
 
 try:
     from adam_atan2 import AdamATan2
-    HAS_ADAM_ATAN2 = True
-except ImportError:
-    HAS_ADAM_ATAN2 = False
+except (ImportError, ModuleNotFoundError):
+    from torch.optim import AdamW as AdamATan2
+    print("WARNING: adam_atan2 not available, falling back to AdamW")
 
 # ---------------------------------------------------------------------------
 # Tiny config
@@ -99,12 +99,8 @@ def main():
     print(f"Parameters: {num_params:,}")
 
     # Optimizer
-    if HAS_ADAM_ATAN2:
-        optimizer = AdamATan2(model.parameters(), lr=LR, weight_decay=0.1)
-        print("Optimizer: AdamATan2")
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-        print("Optimizer: Adam (adam_atan2 not installed, falling back)")
+    optimizer = AdamATan2(model.parameters(), lr=LR, weight_decay=0.1)
+    print(f"Optimizer: {type(optimizer).__name__}")
 
     # Data
     loader = DataLoader(SyntheticDataset(NUM_STEPS), batch_size=None)

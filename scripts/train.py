@@ -26,7 +26,11 @@ from omegaconf import DictConfig
 from torch import nn
 from torch.utils.data import DataLoader
 
-from adam_atan2 import AdamATan2  # pip install adam-atan2
+try:
+    from adam_atan2 import AdamATan2
+except (ImportError, ModuleNotFoundError):
+    from torch.optim import AdamW as AdamATan2
+    print("WARNING: adam_atan2 not available, falling back to AdamW")
 
 from coral.data.puzzle_dataset import PuzzleDatasetMetadata, create_dataloader
 from coral.models.coral_base import CoralConfig
