@@ -189,13 +189,24 @@ class TestCoralInnerStructure:
         assert carry.z_L.shape == (BATCH, SEQ_LEN, HIDDEN)
 
     def test_reset_carry_replaces_halted(self):
-        """Halted positions should be replaced with init values."""
+        """Halted positions should be replaced with init values; non-halted keep old values."""
         model = make_model()
         carry = model.empty_carry(BATCH)
+        # Fill with a known sentinel so comparisons against uninitialized memory are reliable
+        carry.z_H.fill_(99.0)
+        carry.z_L.fill_(99.0)
+
         reset_flag = torch.tensor([True, False])
         new_carry = model.reset_carry(reset_flag, carry)
-        assert torch.allclose(new_carry.z_H[0], model.H_init.expand(SEQ_LEN, HIDDEN))
-        assert torch.allclose(new_carry.z_H[1], carry.z_H[1])
+
+        total_seq = model.total_seq_len  # seq_len + puzzle_emb_len (=SEQ_LEN when ndim=0)
+
+        # Halted sequence (index 0) should match H_init / L_init broadcast
+        assert torch.allclose(new_carry.z_H[0], model.H_init.expand(total_seq, HIDDEN))
+        assert torch.allclose(new_carry.z_L[0], model.L_init.expand(total_seq, HIDDEN))
+        # Non-halted sequence (index 1) should keep the sentinel value
+        assert (new_carry.z_H[1] == 99.0).all()
+        assert (new_carry.z_L[1] == 99.0).all()
 
 
 # ---------------------------------------------------------------------------
