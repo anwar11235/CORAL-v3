@@ -63,6 +63,11 @@ class CoralConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
 
+    # Phase 1: predictive coding
+    use_predictive_coding: bool = False
+    lambda_pred: float = 0.1   # weight for precision-weighted prediction error loss
+    lambda_pi: float = 0.01    # weight for precision regularisation loss
+
 
 # ---------------------------------------------------------------------------
 # Carry (state between segments)

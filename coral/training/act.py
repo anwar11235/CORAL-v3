@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from coral.models.coral_base import CoralConfig, CoralInner, InnerCarry
+from coral.models.coral_v3 import CoralV3Inner, PredMetrics
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,137 @@ class CoralACT(nn.Module):
                 # inner returns (new_carry, logits, (q_halt, q_continue)); we only need [-1].
                 next_q_halt, next_q_continue = self.inner(new_inner_carry, new_current_data)[-1]
                 # target_q_continue = sigmoid(q_halt) at last step, else sigmoid(max(q_halt, q_continue))
+                target_q_continue = torch.sigmoid(
+                    torch.where(
+                        is_last_step,
+                        next_q_halt,
+                        torch.maximum(next_q_halt, next_q_continue),
+                    )
+                )
+                outputs["target_q_continue"] = target_q_continue
+
+        new_carry = ACTCarry(
+            inner_carry=new_inner_carry,
+            steps=new_steps,
+            halted=halted,
+            current_data=new_current_data,
+        )
+        return new_carry, outputs
+
+
+# ---------------------------------------------------------------------------
+# CoralV3ACT — ACT wrapper for CoralV3Inner (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class CoralV3ACT(nn.Module):
+    """ACT wrapper around CoralV3Inner.
+
+    Identical to CoralACT except:
+      - Uses CoralV3Inner instead of CoralInner.
+      - Handles the optional 4th return value (PredMetrics) from CoralV3Inner
+        when use_predictive_coding=True.
+      - Forwards epsilon_final, pi_final, and logging scalars through the
+        outputs dict so CoralV3LossHead can compute the free energy loss.
+
+    When config.use_predictive_coding=False the behaviour is identical to
+    CoralACT (no extra overhead, no extra outputs).
+
+    Args:
+        config: CoralConfig (with use_predictive_coding field).
+    """
+
+    def __init__(self, config: CoralConfig) -> None:
+        super().__init__()
+        if isinstance(config, dict):
+            config = CoralConfig(**config)
+        self.config = config
+        self.inner = CoralV3Inner(config)
+
+    @property
+    def puzzle_emb(self):
+        """Expose puzzle_emb for the sparse embedding optimizer."""
+        return self.inner.puzzle_emb  # AttributeError if puzzle_emb_ndim == 0
+
+    def initial_carry(self, batch: Dict[str, torch.Tensor]) -> ACTCarry:
+        """Create the initial carry for a new evaluation run."""
+        batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
+        return ACTCarry(
+            inner_carry=self.inner.empty_carry(batch_size, device=device),
+            steps=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            halted=torch.ones(batch_size, dtype=torch.bool, device=device),
+            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+        )
+
+    def forward(
+        self,
+        carry: ACTCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> tuple:
+        """Run one ACT segment.
+
+        Returns:
+            (new_carry, outputs) where outputs is a dict containing:
+                "logits"             — [B, seq_len, vocab_size]
+                "q_halt_logits"      — [B] float32
+                "q_continue_logits"  — [B] float32
+                "target_q_continue"  — [B] float32  (training only)
+            When use_predictive_coding=True, outputs additionally contains:
+                "epsilon_final"      — [B, seq_len, hidden_size] with grad
+                "pi_final"           — [B, seq_len, hidden_size] with grad
+                "pred_error_norm"    — scalar (mean over all steps, detached)
+                "precision_mean"     — scalar (mean over all steps, detached)
+        """
+        # --- 1. Reset halted sequences ---
+        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
+        new_current_data = {
+            k: torch.where(
+                carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)),
+                batch[k],
+                v,
+            )
+            for k, v in carry.current_data.items()
+        }
+
+        # --- 2. Run inner model ---
+        inner_result = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = inner_result[:3]
+
+        outputs: Dict[str, torch.Tensor] = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits,
+        }
+
+        # Unpack prediction metrics when predictive coding is active
+        if self.config.use_predictive_coding:
+            pred_metrics: PredMetrics = inner_result[3]
+            outputs["epsilon_final"] = pred_metrics.epsilon_final  # type: ignore[assignment]
+            outputs["pi_final"] = pred_metrics.pi_final  # type: ignore[assignment]
+            if pred_metrics.pred_error_norms:
+                outputs["pred_error_norm"] = torch.stack(pred_metrics.pred_error_norms).mean()
+                outputs["precision_mean"] = torch.stack(pred_metrics.precision_means).mean()
+
+        # --- 3. Halting logic ---
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= self.config.halt_max_steps
+            halted = is_last_step
+
+            if self.training and self.config.halt_max_steps > 1:
+                halted = halted | (q_halt_logits > q_continue_logits)
+
+                exploration_mask = torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob
+                min_halt_steps = exploration_mask.to(torch.int32) * torch.randint_like(
+                    new_steps, low=2, high=self.config.halt_max_steps + 1
+                )
+                halted = halted & (new_steps >= min_halt_steps)
+
+                # --- 4. Bootstrap target Q ---
+                # Take index 2 explicitly — inner may return 3 or 4 values.
+                next_q_halt, next_q_continue = self.inner(new_inner_carry, new_current_data)[2]
                 target_q_continue = torch.sigmoid(
                     torch.where(
                         is_last_step,

@@ -216,3 +216,170 @@ class ACTLossHead(nn.Module):
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
+
+
+# ---------------------------------------------------------------------------
+# Predictive coding loss (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def predictive_coding_loss(
+    epsilon: torch.Tensor,
+    pi: torch.Tensor,
+    lambda_pred: float = 0.1,
+    lambda_pi: float = 0.01,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Free energy loss terms for predictive coding.
+
+    Args:
+        epsilon: Prediction error [B, seq_len, dim] from the final 1-step-grad step.
+        pi:      Precision vector [B, seq_len, dim] from the final 1-step-grad step.
+        lambda_pred: Weight for the precision-weighted prediction error term.
+        lambda_pi:   Weight for the precision regulariser term.
+
+    Returns:
+        pred_loss: Scalar. Encourages accurate predictions (weighted by learned precision).
+        pi_reg:    Scalar. Regularises precision to prevent collapse (→ 0) or explosion (→ ∞).
+    """
+    # Precision-weighted squared prediction error
+    pred_loss = lambda_pred * 0.5 * (pi * epsilon ** 2).sum(dim=-1).mean()
+    # Entropy regulariser: encourages high-entropy (diffuse) precision priors
+    pi_reg = lambda_pi * (-0.5) * torch.log(pi + 1e-8).sum(dim=-1).mean()
+    return pred_loss, pi_reg
+
+
+# ---------------------------------------------------------------------------
+# CoralV3LossHead (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class CoralV3LossHead(nn.Module):
+    """Loss head for CoralV3ACT — extends ACTLossHead with free energy terms.
+
+    When config.use_predictive_coding=False the total loss is identical to
+    ACTLossHead:
+        total = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+
+    When config.use_predictive_coding=True the free energy terms are added:
+        total = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+                + pred_loss + pi_reg
+
+    Metrics also include pred_error_norm and precision_mean when predictive
+    coding is active.
+
+    Args:
+        model:     A CoralV3ACT instance.
+        loss_type: "stablemax_cross_entropy" or "softmax_cross_entropy".
+    """
+
+    def __init__(self, model: nn.Module, loss_type: str) -> None:
+        super().__init__()
+        self.model = model
+        _loss_fns = {
+            "stablemax_cross_entropy": stablemax_cross_entropy,
+            "softmax_cross_entropy": softmax_cross_entropy,
+        }
+        if loss_type not in _loss_fns:
+            raise ValueError(f"Unknown loss_type: {loss_type!r}. Choose from {list(_loss_fns)}")
+        self.loss_fn = _loss_fns[loss_type]
+
+    def initial_carry(self, *args, **kwargs):
+        return self.model.initial_carry(*args, **kwargs)  # type: ignore[operator]
+
+    @property
+    def puzzle_emb(self):
+        return self.model.puzzle_emb  # type: ignore[attr-defined]
+
+    def forward(
+        self,
+        return_keys: Sequence[str],
+        **model_kwargs,
+    ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        """Run one ACT segment and compute loss + metrics.
+
+        Args:
+            return_keys: Keys from model outputs to include in detached_outputs.
+            **model_kwargs: Forwarded to model.forward() (carry=..., batch=...).
+
+        Returns:
+            (new_carry, loss, metrics, detached_outputs, all_halted)
+        """
+        new_carry, outputs = self.model(**model_kwargs)
+        labels = new_carry.current_data["labels"]
+
+        with torch.no_grad():
+            mask = labels != IGNORE_LABEL_ID
+            loss_counts = mask.sum(-1)
+            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+
+            preds_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
+            seq_is_correct = preds_correct.sum(-1) == loss_counts
+
+            valid_metrics = new_carry.halted & (loss_counts > 0)
+            metrics: Dict[str, torch.Tensor] = {
+                "count": valid_metrics.sum(),
+                "accuracy": torch.where(
+                    valid_metrics,
+                    (preds_correct.to(torch.float32) / loss_divisor).sum(-1),
+                    torch.zeros_like(loss_counts, dtype=torch.float32),
+                ).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                "q_halt_accuracy": (
+                    valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)
+                ).sum(),
+                "steps": torch.where(
+                    valid_metrics,
+                    new_carry.steps.to(torch.float32),
+                    torch.zeros_like(new_carry.steps, dtype=torch.float32),
+                ).sum(),
+            }
+
+        # ---- LM loss ----
+        lm_loss = (
+            self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor
+        ).sum()
+
+        # ---- Q-halt loss ----
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"],
+            seq_is_correct.to(outputs["q_halt_logits"].dtype),
+            reduction="sum",
+        )
+
+        metrics["lm_loss"] = lm_loss.detach()
+        metrics["q_halt_loss"] = q_halt_loss.detach()
+
+        # ---- Q-continue loss ----
+        q_continue_loss: torch.Tensor = torch.tensor(0.0, device=lm_loss.device)
+        if "target_q_continue" in outputs:
+            q_continue_loss = F.binary_cross_entropy_with_logits(
+                outputs["q_continue_logits"],
+                outputs["target_q_continue"],
+                reduction="sum",
+            )
+            metrics["q_continue_loss"] = q_continue_loss.detach()
+
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+
+        # ---- Predictive coding loss (only when epsilon/pi are present) ----
+        if "epsilon_final" in outputs and outputs["epsilon_final"] is not None:
+            lambda_pred = self.model.config.lambda_pred  # type: ignore[attr-defined]
+            lambda_pi = self.model.config.lambda_pi      # type: ignore[attr-defined]
+            pred_loss, pi_reg = predictive_coding_loss(
+                outputs["epsilon_final"],
+                outputs["pi_final"],
+                lambda_pred=lambda_pred,
+                lambda_pi=lambda_pi,
+            )
+            total_loss = total_loss + pred_loss + pi_reg
+            metrics["pred_loss"] = pred_loss.detach()
+            metrics["pi_reg"] = pi_reg.detach()
+
+        # Logging scalars for pred error norm / precision
+        for key in ("pred_error_norm", "precision_mean"):
+            if key in outputs:
+                metrics[key] = outputs[key].detach()
+
+        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
