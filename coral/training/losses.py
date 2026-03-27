@@ -239,12 +239,15 @@ def predictive_coding_loss(
 
     Returns:
         pred_loss: Scalar. Encourages accurate predictions (weighted by learned precision).
-        pi_reg:    Scalar. Regularises precision to prevent collapse (→ 0) or explosion (→ ∞).
+        pi_reg:    Scalar. Regularises precision toward unit value, preventing both
+                   collapse (→ 0) and explosion (→ ∞).  Equivalent to a log-normal
+                   prior centred at π = 1: minimum at log(π) = 0, symmetric penalty
+                   in log-space for deviations in either direction.
     """
     # Precision-weighted squared prediction error
     pred_loss = lambda_pred * 0.5 * (pi * epsilon ** 2).sum(dim=-1).mean()
-    # Entropy regulariser: encourages high-entropy (diffuse) precision priors
-    pi_reg = lambda_pi * (-0.5) * torch.log(pi + 1e-8).sum(dim=-1).mean()
+    # Log-normal regulariser: penalises log(π) ≠ 0, symmetric around π = 1
+    pi_reg = lambda_pi * 0.5 * (torch.log(pi + 1e-8) ** 2).sum(dim=-1).mean()
     return pred_loss, pi_reg
 
 
