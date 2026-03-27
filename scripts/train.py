@@ -14,7 +14,7 @@ import math
 import os
 import shutil
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 import hydra
 import pydantic
@@ -114,7 +114,6 @@ class TrainConfig(pydantic.BaseModel):
     project_name: Optional[str] = None
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
-    checkpoint_every_eval: bool = False
     eval_save_outputs: List[str] = []
 
 
@@ -418,14 +417,52 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 
-def save_checkpoint(config: TrainConfig, state: TrainState) -> None:
+def save_checkpoint(
+    config: TrainConfig,
+    state: TrainState,
+    run_name: str,
+    eval_exact_acc: float,
+    best_path: Optional[str],
+    latest_path: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Save a step-stamped checkpoint; keep only best and latest.
+
+    Returns:
+        (new_best_path, new_latest_path) — callers should persist these.
+    """
     if config.checkpoint_path is None:
-        return
+        return best_path, latest_path
+
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(
-        state.model.state_dict(),
-        os.path.join(config.checkpoint_path, f"step_{state.step}.pt"),
+    new_path = os.path.join(
+        config.checkpoint_path, f"{run_name}_step{state.step}.pt"
     )
+    torch.save(state.model.state_dict(), new_path)
+    print(
+        f"[CORAL-v3] Checkpoint saved: {new_path}"
+        f" (eval_exact_accuracy={eval_exact_acc:.4f})"
+    )
+
+    # Determine whether this is the new best
+    best_acc = getattr(save_checkpoint, "_best_acc", -1.0)
+    is_new_best = eval_exact_acc > best_acc
+    if is_new_best:
+        save_checkpoint._best_acc = eval_exact_acc  # type: ignore[attr-defined]
+        print(f"[CORAL-v3] New best checkpoint: {new_path}")
+
+    new_best_path = new_path if is_new_best else best_path
+    new_latest_path = new_path
+
+    # Delete stale checkpoints (anything that is neither best nor latest)
+    paths_to_keep = {p for p in (new_best_path, new_latest_path) if p is not None}
+    for old_path in (best_path, latest_path):
+        if old_path is not None and old_path not in paths_to_keep:
+            try:
+                os.remove(old_path)
+            except FileNotFoundError:
+                pass
+
+    return new_best_path, new_latest_path
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +546,9 @@ def main(hydra_config: DictConfig) -> None:
         )
         pbar = tqdm.tqdm(total=state.total_steps)
 
+    best_checkpoint_path: Optional[str] = None
+    latest_checkpoint_path: Optional[str] = None
+
     for _iter in range(total_iters):
         if RANK == 0:
             print(f"[CORAL-v3] Epoch {_iter * eval_interval}")
@@ -542,8 +582,20 @@ def main(hydra_config: DictConfig) -> None:
             wandb.log(flat, step=state.step)
 
         # ---- Checkpoint ----
-        if RANK == 0 and (config.checkpoint_every_eval or _iter == total_iters - 1):
-            save_checkpoint(config, state)
+        if RANK == 0 and eval_metrics:
+            # Extract best exact_accuracy across all eval sets
+            eval_exact_acc = max(
+                m.get("exact_accuracy", 0.0)
+                for m in eval_metrics.values()
+            )
+            best_checkpoint_path, latest_checkpoint_path = save_checkpoint(
+                config,
+                state,
+                run_name=config.run_name,
+                eval_exact_acc=eval_exact_acc,
+                best_path=best_checkpoint_path,
+                latest_path=latest_checkpoint_path,
+            )
 
     if dist.is_initialized():
         dist.destroy_process_group()
