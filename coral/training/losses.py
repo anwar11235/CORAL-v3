@@ -405,10 +405,12 @@ class CoralV3LossHead(nn.Module):
             metrics["pred_loss"] = pred_loss.detach()
             metrics["pi_reg"] = pi_reg.detach()
 
-        # Logging scalars for pred error norm / precision
-        for key in ("pred_error_norm", "precision_mean"):
+        # Logging scalars for prediction error / precision
+        for key in ("prediction_error", "precision_mean"):
             if key in outputs:
                 metrics[key] = outputs[key].detach()
+        if "pi_final" in outputs and outputs["pi_final"] is not None:
+            metrics["precision_std"] = outputs["pi_final"].std().detach()
 
         # ---- Load-balancing loss (only when routing logits are present) ----
         routing_logits_H = outputs.get("routing_logits_H")
@@ -419,7 +421,7 @@ class CoralV3LossHead(nn.Module):
             lambda_balance = self.model.config.lambda_balance  # type: ignore[attr-defined]
             balance_loss = load_balancing_loss(all_routing_logits, S)
             total_loss = total_loss + lambda_balance * balance_loss
-            metrics["balance_loss"] = balance_loss.detach()
+            metrics["load_balance_loss"] = balance_loss.detach()
             # Router entropy: mean over all blocks of mean per-sample routing entropy
             with torch.no_grad():
                 entropies = []

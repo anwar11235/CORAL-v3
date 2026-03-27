@@ -19,7 +19,7 @@ Components:
   crystallization_supervision_loss — BCE loss that trains the confidence gate
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -188,10 +188,10 @@ class CrystallizationBuffer:
         recognition_net: RecognitionNetwork,
         num_iterations: int = 100,
         device: str = "cpu",
-    ) -> None:
+    ) -> Optional[float]:
         """Update the codebook via offline k-means-like assignment + EMA.
 
-        Requires at least 100 stored pairs; silently returns otherwise.
+        Requires at least 100 stored pairs; silently returns None otherwise.
 
         Each stored (key, value) pair is assigned to the nearest codebook key
         by cosine similarity.  For each cluster, the codebook entry (both value
@@ -203,12 +203,19 @@ class CrystallizationBuffer:
             num_iterations:  Number of assignment + update rounds.
             device:          Device to use for the computation (should match
                              recognition_net's parameter device).
+
+        Returns:
+            Fraction of codebook entries that received at least one assignment
+            in the final iteration, or None if the buffer was too small.
         """
         if len(self.keys) < 100:
-            return
+            return None
 
         all_keys = torch.stack(self.keys).to(device)      # [N, proj_dim*2]
         all_values = torch.stack(self.values).to(device)  # [N, l_dim]
+
+        K = recognition_net.codebook.shape[0]
+        assignments: Optional[torch.Tensor] = None
 
         with torch.no_grad():
             for _ in range(num_iterations):
@@ -221,7 +228,6 @@ class CrystallizationBuffer:
                 assignments = sims.argmax(dim=1)  # [N]
 
                 # EMA update for each codebook entry
-                K = recognition_net.codebook.shape[0]
                 for k_idx in range(K):
                     mask = assignments == k_idx
                     if mask.sum() > 0:
@@ -233,6 +239,12 @@ class CrystallizationBuffer:
                         recognition_net.codebook_keys.data[k_idx] = (
                             0.9 * recognition_net.codebook_keys.data[k_idx] + 0.1 * mean_key
                         )
+
+        # Codebook usage: fraction of K entries with at least one assignment
+        if assignments is not None:
+            used = int(assignments.bincount(minlength=K).gt(0).sum().item())
+            return float(used) / K
+        return None
 
     def clear(self) -> None:
         """Empty the buffer (call after consolidation)."""

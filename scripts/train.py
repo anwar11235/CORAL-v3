@@ -34,10 +34,11 @@ except ImportError:
     FUSED_ADAM_ATAN2 = False
 
 from coral.data.puzzle_dataset import PuzzleDatasetMetadata, create_dataloader
+from coral.models.columnar import ColumnarTransformerBlock
 from coral.models.coral_base import CoralConfig
 from coral.models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
-from coral.training.act import CoralACT
-from coral.training.losses import ACTLossHead
+from coral.training.act import CoralACT, CoralV3ACT
+from coral.training.losses import ACTLossHead, CoralV3LossHead
 from coral.training.scheduler import cosine_schedule_with_warmup_lr_lambda
 
 
@@ -70,6 +71,28 @@ class TrainConfig(pydantic.BaseModel):
     halt_max_steps: int = 16
     halt_exploration_prob: float = 0.1
     forward_dtype: str = "bfloat16"
+
+    # Phase 1: predictive coding
+    use_predictive_coding: bool = False
+    lambda_pred: float = 0.1
+    lambda_pi: float = 0.01
+
+    # Phase 2: sparse columnar routing
+    use_columnar_routing: bool = False
+    num_columns: int = 8
+    active_columns: int = 2
+    lambda_balance: float = 0.01
+    column_warmup_steps: int = 5000   # steps to anneal from start_k → active_columns; 0 = skip
+    column_warmup_start_k: int = 8    # k at step 0 (defaults to S = num_columns)
+
+    # Phase 3: recognition-gated crystallization
+    use_crystallization: bool = False
+    codebook_size: int = 256
+    crystal_proj_dim: int = 128
+    crystal_confidence_threshold: float = 0.8
+    crystal_buffer_capacity: int = 10000
+    crystal_consolidation_interval: int = 5000  # steps between codebook consolidations; 0 = never
+    lambda_crystal: float = 0.1
 
     # Loss
     loss_type: str = "stablemax_cross_entropy"
@@ -135,11 +158,34 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
         halt_max_steps=config.halt_max_steps,
         halt_exploration_prob=config.halt_exploration_prob,
         forward_dtype=config.forward_dtype,
+        # Phase 1: predictive coding
+        use_predictive_coding=config.use_predictive_coding,
+        lambda_pred=config.lambda_pred,
+        lambda_pi=config.lambda_pi,
+        # Phase 2: sparse columnar routing
+        use_columnar_routing=config.use_columnar_routing,
+        num_columns=config.num_columns,
+        active_columns=config.active_columns,
+        lambda_balance=config.lambda_balance,
+        # Phase 3: crystallization
+        use_crystallization=config.use_crystallization,
+        codebook_size=config.codebook_size,
+        crystal_proj_dim=config.crystal_proj_dim,
+        crystal_confidence_threshold=config.crystal_confidence_threshold,
+        crystal_buffer_capacity=config.crystal_buffer_capacity,
+        lambda_crystal=config.lambda_crystal,
     )
 
+    _any_v3 = config.use_predictive_coding or config.use_columnar_routing or config.use_crystallization
+
     with torch.device("cuda"):
-        inner_model = CoralACT(coral_cfg)
-        model: nn.Module = ACTLossHead(inner_model, loss_type=config.loss_type)
+        if _any_v3:
+            inner_model = CoralV3ACT(coral_cfg)
+            model: nn.Module = CoralV3LossHead(inner_model, loss_type=config.loss_type)
+        else:
+            inner_model = CoralACT(coral_cfg)
+            model = ACTLossHead(inner_model, loss_type=config.loss_type)
+
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model, dynamic=False)  # type: ignore[assignment]
 
@@ -179,6 +225,24 @@ def build_optimizers(model: nn.Module, config: TrainConfig, world_size: int):
     optimizer_lrs.append(config.lr)
 
     return optimizers, optimizer_lrs
+
+
+def compute_active_columns(config: TrainConfig, step: int) -> int:
+    """Linearly anneal active columns from column_warmup_start_k to active_columns."""
+    if not config.use_columnar_routing or config.column_warmup_steps == 0:
+        return config.active_columns
+    if step >= config.column_warmup_steps:
+        return config.active_columns
+    frac = step / config.column_warmup_steps
+    k = config.column_warmup_start_k + frac * (config.active_columns - config.column_warmup_start_k)
+    return max(config.active_columns, round(k))
+
+
+def set_active_columns(model: nn.Module, k: int) -> None:
+    """Update k on every ColumnarTransformerBlock in the model."""
+    for module in model.modules():
+        if isinstance(module, ColumnarTransformerBlock):
+            module.k = k
 
 
 def init_train_state(
@@ -234,6 +298,12 @@ def train_batch(
     if state.step > state.total_steps:
         return None
 
+    # Column warm-up: anneal active k from start_k → target k over warmup_steps
+    current_k = config.active_columns
+    if config.use_columnar_routing:
+        current_k = compute_active_columns(config, state.step)
+        set_active_columns(state.model, current_k)
+
     batch = {k: v.cuda() for k, v in batch.items()}
 
     if state.carry is None:
@@ -274,6 +344,8 @@ def train_batch(
             for k, v in reduced.items()
         }
         reduced["train/lr"] = lr_this_step
+        if config.use_columnar_routing:
+            reduced["train/active_columns"] = current_k
         return reduced
 
     return None
@@ -330,7 +402,12 @@ def evaluate(
                 for sid, sname in enumerate(eval_metadata.sets):
                     m = {metric_keys[i]: mv[sid, i] for i in range(len(metric_keys))}
                     count = max(m.pop("count"), 1)
-                    result[sname] = {k: v / count for k, v in m.items()}
+                    m = {k: v / count for k, v in m.items()}
+                    # Convert crystal_bypass_count → crystal_bypass_rate (eval only)
+                    if "crystal_bypass_count" in m:
+                        h_bypassable = max(config.H_cycles - 1, 1)
+                        m["crystal_bypass_rate"] = m.pop("crystal_bypass_count") / h_bypassable
+                    result[sname] = m
                 return result
 
     return None
@@ -443,6 +520,19 @@ def main(hydra_config: DictConfig) -> None:
             if RANK == 0 and metrics:
                 wandb.log(metrics, step=state.step)
                 pbar.update(state.step - pbar.n)  # type: ignore[operator]
+
+            # Crystallization codebook consolidation
+            if (
+                config.use_crystallization
+                and config.crystal_consolidation_interval > 0
+                and state.step % config.crystal_consolidation_interval == 0
+            ):
+                inner = state.model.model.inner  # type: ignore[attr-defined]
+                usage = inner.consolidate_codebook()
+                if RANK == 0:
+                    print(f"[CORAL-v3] Codebook consolidation at step {state.step}")
+                    if usage is not None:
+                        wandb.log({"train/codebook_usage": usage}, step=state.step)
 
         # ---- Eval ----
         state.model.eval()

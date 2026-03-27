@@ -288,7 +288,7 @@ class CoralV3ACT(nn.Module):
                 outputs["epsilon_final"] = pred_metrics.epsilon_final  # type: ignore[assignment]
                 outputs["pi_final"] = pred_metrics.pi_final  # type: ignore[assignment]
             if pred_metrics.pred_error_norms:
-                outputs["pred_error_norm"] = torch.stack(pred_metrics.pred_error_norms).mean()
+                outputs["prediction_error"] = torch.stack(pred_metrics.pred_error_norms).mean()
                 outputs["precision_mean"] = torch.stack(pred_metrics.precision_means).mean()
             if pred_metrics.routing_logits_H is not None:
                 outputs["routing_logits_H"] = pred_metrics.routing_logits_H  # type: ignore[assignment]
@@ -298,6 +298,12 @@ class CoralV3ACT(nn.Module):
             outputs["crystal_bypass_count"] = torch.tensor(
                 float(pred_metrics.crystal_bypass_count), device=logits.device
             )
+            if self.config.use_crystallization:
+                outputs["crystal_confidence_mean"] = torch.tensor(
+                    pred_metrics.crystal_confidence_mean,
+                    device=logits.device,
+                    dtype=torch.float32,
+                )
 
         # --- 3. Halting logic ---
         with torch.no_grad():

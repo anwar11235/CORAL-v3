@@ -86,6 +86,7 @@ class PredMetrics:
     routing_logits_L: Optional[List[torch.Tensor]] = field(default=None)
     crystal_supervision_loss_final: Optional[torch.Tensor] = field(default=None)
     crystal_bypass_count: int = field(default=0)
+    crystal_confidence_mean: float = field(default=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +154,7 @@ class CoralV3Inner(CoralInner):
         z_H: torch.Tensor,
         z_L: torch.Tensor,
         cos_sin,
-    ) -> Tuple[bool, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[bool, torch.Tensor, torch.Tensor, float]:
         """Attempt crystallization bypass for a non-last H-cycle in eval mode.
 
         Bypass fires when:
@@ -174,15 +175,18 @@ class CoralV3Inner(CoralInner):
             cos_sin: RoPE cache (or None).
 
         Returns:
-            (bypassed, new_z_H, new_z_L)
+            (bypassed, new_z_H, new_z_L, confidence_mean)
+            confidence_mean is the mean recognition confidence for this H-cycle
+            (0.0 when crystallization is disabled, in training mode, or last H-cycle).
         """
         is_last_h = h_step == self.config.H_cycles - 1
         if not self.config.use_crystallization or self.training or is_last_h:
-            return False, z_H, z_L
+            return False, z_H, z_L, 0.0
 
         confidence, nearest_code, _ = self.recognition_net(z_H, z_L)
-        if confidence.mean().item() <= self.config.crystal_confidence_threshold:
-            return False, z_H, z_L
+        conf_mean = confidence.mean().item()
+        if conf_mean <= self.config.crystal_confidence_threshold:
+            return False, z_H, z_L, conf_mean
 
         # Bypass: substitute z_L, then update H with the substituted value
         z_L = nearest_code
@@ -199,7 +203,7 @@ class CoralV3Inner(CoralInner):
         else:
             z_H = self.H_level(z_H, injection, cos_sin=cos_sin)
 
-        return True, z_H, z_L
+        return True, z_H, z_L, conf_mean
 
     def _maybe_record_crystal(self, z_H: torch.Tensor, z_L: torch.Tensor) -> None:
         """Add current (z_H, z_L) to the crystal buffer during training.
@@ -228,17 +232,22 @@ class CoralV3Inner(CoralInner):
             return None
         return crystallization_supervision_loss(self.recognition_net, z_H, z_L_final)
 
-    def consolidate_codebook(self) -> None:
+    def consolidate_codebook(self) -> Optional[float]:
         """Offline codebook update — call periodically from the training loop.
 
         Runs k-means-like assignment + EMA on the crystal buffer, then clears it.
-        Typically called every `crystal_consolidation_interval` epochs.
+        Typically called every N training steps.
+
+        Returns:
+            Fraction of codebook entries that had at least one assignment in the
+            final k-means iteration, or None if the buffer was too small to consolidate.
         """
         if not self.config.use_crystallization:
-            return
+            return None
         device = str(next(self.recognition_net.parameters()).device)
-        self.crystal_buffer.consolidate(self.recognition_net, device=device)
+        usage = self.crystal_buffer.consolidate(self.recognition_net, device=device)
         self.crystal_buffer.clear()
+        return usage
 
     # ------------------------------------------------------------------
     # Forward dispatch
@@ -292,11 +301,16 @@ class CoralV3Inner(CoralInner):
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
             crystal_bypassed = 0
+            _conf_total = 0.0
+            _conf_steps = 0
 
             for h_step in range(self.config.H_cycles):
-                bypassed, z_H, z_L = self._maybe_crystal_bypass_nograd(
+                bypassed, z_H, z_L, conf = self._maybe_crystal_bypass_nograd(
                     h_step, z_H, z_L, cos_sin
                 )
+                if conf > 0.0:
+                    _conf_total += conf
+                    _conf_steps += 1
                 if bypassed:
                     crystal_bypassed += 1
                     continue
@@ -331,6 +345,7 @@ class CoralV3Inner(CoralInner):
             pi_final=None,
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
+            crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
 
@@ -352,11 +367,16 @@ class CoralV3Inner(CoralInner):
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
             crystal_bypassed = 0
+            _conf_total = 0.0
+            _conf_steps = 0
 
             for h_step in range(self.config.H_cycles):
-                bypassed, z_H, z_L = self._maybe_crystal_bypass_nograd(
+                bypassed, z_H, z_L, conf = self._maybe_crystal_bypass_nograd(
                     h_step, z_H, z_L, cos_sin
                 )
+                if conf > 0.0:
+                    _conf_total += conf
+                    _conf_steps += 1
                 if bypassed:
                     crystal_bypassed += 1
                     continue
@@ -406,6 +426,7 @@ class CoralV3Inner(CoralInner):
             pi_final=pi_final,
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
+            crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
 
@@ -424,11 +445,16 @@ class CoralV3Inner(CoralInner):
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
             crystal_bypassed = 0
+            _conf_total = 0.0
+            _conf_steps = 0
 
             for h_step in range(self.config.H_cycles):
-                bypassed, z_H, z_L = self._maybe_crystal_bypass_nograd(
+                bypassed, z_H, z_L, conf = self._maybe_crystal_bypass_nograd(
                     h_step, z_H, z_L, cos_sin
                 )
+                if conf > 0.0:
+                    _conf_total += conf
+                    _conf_steps += 1
                 if bypassed:
                     crystal_bypassed += 1
                     continue
@@ -465,6 +491,7 @@ class CoralV3Inner(CoralInner):
             routing_logits_L=routing_logits_L,
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
+            crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
 
@@ -486,11 +513,16 @@ class CoralV3Inner(CoralInner):
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
             crystal_bypassed = 0
+            _conf_total = 0.0
+            _conf_steps = 0
 
             for h_step in range(self.config.H_cycles):
-                bypassed, z_H, z_L = self._maybe_crystal_bypass_nograd(
+                bypassed, z_H, z_L, conf = self._maybe_crystal_bypass_nograd(
                     h_step, z_H, z_L, cos_sin
                 )
+                if conf > 0.0:
+                    _conf_total += conf
+                    _conf_steps += 1
                 if bypassed:
                     crystal_bypassed += 1
                     continue
@@ -542,5 +574,6 @@ class CoralV3Inner(CoralInner):
             routing_logits_L=routing_logits_L,
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
+            crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
