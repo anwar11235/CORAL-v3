@@ -118,7 +118,7 @@ class ColumnarTransformerBlock(nn.Module):
             result.index_add_(
                 0,
                 src_samples,
-                src_weights.unsqueeze(-1).unsqueeze(-1) * col_out,
+                (src_weights.unsqueeze(-1).unsqueeze(-1) * col_out).to(result.dtype),
             )
 
         return result, routing_logits
