@@ -276,8 +276,13 @@ class CoralV3ACT(nn.Module):
             "q_continue_logits": q_continue_logits,
         }
 
-        # Unpack prediction / routing metrics when either mechanism is active
-        if self.config.use_predictive_coding or self.config.use_columnar_routing:
+        # Unpack prediction / routing / crystal metrics when any mechanism is active
+        _any_mechanism = (
+            self.config.use_predictive_coding
+            or self.config.use_columnar_routing
+            or self.config.use_crystallization
+        )
+        if _any_mechanism:
             pred_metrics: PredMetrics = inner_result[3]
             if pred_metrics.epsilon_final is not None:
                 outputs["epsilon_final"] = pred_metrics.epsilon_final  # type: ignore[assignment]
@@ -288,6 +293,11 @@ class CoralV3ACT(nn.Module):
             if pred_metrics.routing_logits_H is not None:
                 outputs["routing_logits_H"] = pred_metrics.routing_logits_H  # type: ignore[assignment]
                 outputs["routing_logits_L"] = pred_metrics.routing_logits_L  # type: ignore[assignment]
+            if pred_metrics.crystal_supervision_loss_final is not None:
+                outputs["crystal_supervision_loss_final"] = pred_metrics.crystal_supervision_loss_final  # type: ignore[assignment]
+            outputs["crystal_bypass_count"] = torch.tensor(
+                float(pred_metrics.crystal_bypass_count), device=logits.device
+            )
 
         # --- 3. Halting logic ---
         with torch.no_grad():

@@ -74,6 +74,15 @@ class CoralConfig(BaseModel):
     active_columns: int = 2      # k — active columns per sample per block
     lambda_balance: float = 0.01  # weight for load-balancing KL loss
 
+    # Phase 3: recognition-gated crystallization
+    use_crystallization: bool = False
+    codebook_size: int = 256              # K — number of codebook entries
+    crystal_proj_dim: int = 128           # projection dim for recognition key
+    crystal_confidence_threshold: float = 0.8  # bypass fires when mean(confidence) > threshold
+    crystal_buffer_capacity: int = 10000  # ring-buffer capacity for consolidation
+    crystal_consolidation_interval: int = 10   # epochs between consolidation calls
+    lambda_crystal: float = 0.1           # weight for crystallization supervision loss
+
 
 # ---------------------------------------------------------------------------
 # Carry (state between segments)

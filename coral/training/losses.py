@@ -435,6 +435,19 @@ class CoralV3LossHead(nn.Module):
                 for col_idx in range(avg_probs.shape[0]):
                     metrics[f"col_{col_idx}_freq"] = avg_probs[col_idx]
 
+        # ---- Crystallization supervision loss (only during training when enabled) ----
+        crystal_loss = outputs.get("crystal_supervision_loss_final")
+        if crystal_loss is not None:
+            lambda_crystal = self.model.config.lambda_crystal  # type: ignore[attr-defined]
+            total_loss = total_loss + lambda_crystal * crystal_loss
+            metrics["crystal_supervision_loss"] = crystal_loss.detach()
+
+        # Log crystal bypass count and any other crystal scalars
+        for key in ("crystal_bypass_count", "crystal_confidence_mean"):
+            if key in outputs:
+                val = outputs[key]
+                metrics[key] = val.detach() if isinstance(val, torch.Tensor) else val
+
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
