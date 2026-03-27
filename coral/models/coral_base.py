@@ -68,6 +68,12 @@ class CoralConfig(BaseModel):
     lambda_pred: float = 0.1   # weight for precision-weighted prediction error loss
     lambda_pi: float = 0.01    # weight for precision regularisation loss
 
+    # Phase 2: sparse columnar routing
+    use_columnar_routing: bool = False
+    num_columns: int = 8         # S — number of columnar sub-modules per block
+    active_columns: int = 2      # k — active columns per sample per block
+    lambda_balance: float = 0.01  # weight for load-balancing KL loss
+
 
 # ---------------------------------------------------------------------------
 # Carry (state between segments)

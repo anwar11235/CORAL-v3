@@ -249,6 +249,36 @@ def predictive_coding_loss(
 
 
 # ---------------------------------------------------------------------------
+# Load-balancing loss (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def load_balancing_loss(
+    all_routing_logits: list,
+    S: int,
+) -> torch.Tensor:
+    """KL divergence between empirical column usage and a uniform prior.
+
+    Encourages every column to be selected equally often across the batch,
+    preventing column collapse (some columns never selected).
+
+    Args:
+        all_routing_logits: list of [B, S] raw router logits, one per columnar block
+                            (collected from both H and L modules).
+        S:                  Number of columns.
+
+    Returns:
+        Scalar loss; 0 when the distribution is exactly uniform, positive otherwise.
+    """
+    # Average routing distribution across all blocks and all samples → [S]
+    avg_probs = torch.stack(
+        [F.softmax(l, dim=-1) for l in all_routing_logits]
+    ).mean(dim=(0, 1))
+    # KL(avg_probs || Uniform(S)) = S * Σ avg_probs * log(avg_probs * S)
+    return S * (avg_probs * torch.log(avg_probs * S + 1e-8)).sum()
+
+
+# ---------------------------------------------------------------------------
 # CoralV3LossHead (Phase 1)
 # ---------------------------------------------------------------------------
 
@@ -379,6 +409,31 @@ class CoralV3LossHead(nn.Module):
         for key in ("pred_error_norm", "precision_mean"):
             if key in outputs:
                 metrics[key] = outputs[key].detach()
+
+        # ---- Load-balancing loss (only when routing logits are present) ----
+        routing_logits_H = outputs.get("routing_logits_H")
+        routing_logits_L = outputs.get("routing_logits_L")
+        if routing_logits_H is not None and routing_logits_L is not None:
+            all_routing_logits = routing_logits_H + routing_logits_L
+            S = self.model.config.num_columns  # type: ignore[attr-defined]
+            lambda_balance = self.model.config.lambda_balance  # type: ignore[attr-defined]
+            balance_loss = load_balancing_loss(all_routing_logits, S)
+            total_loss = total_loss + lambda_balance * balance_loss
+            metrics["balance_loss"] = balance_loss.detach()
+            # Router entropy: mean over all blocks of mean per-sample routing entropy
+            with torch.no_grad():
+                entropies = []
+                for logits in all_routing_logits:
+                    probs = F.softmax(logits, dim=-1)
+                    entropies.append(-(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean())
+                metrics["router_entropy"] = torch.stack(entropies).mean()
+            # Per-column activation frequency (averaged across H and L blocks)
+            with torch.no_grad():
+                avg_probs = torch.stack(
+                    [F.softmax(l, dim=-1) for l in all_routing_logits]
+                ).mean(dim=(0, 1))  # [S]
+                for col_idx in range(avg_probs.shape[0]):
+                    metrics[f"col_{col_idx}_freq"] = avg_probs[col_idx]
 
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 

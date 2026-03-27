@@ -276,14 +276,18 @@ class CoralV3ACT(nn.Module):
             "q_continue_logits": q_continue_logits,
         }
 
-        # Unpack prediction metrics when predictive coding is active
-        if self.config.use_predictive_coding:
+        # Unpack prediction / routing metrics when either mechanism is active
+        if self.config.use_predictive_coding or self.config.use_columnar_routing:
             pred_metrics: PredMetrics = inner_result[3]
-            outputs["epsilon_final"] = pred_metrics.epsilon_final  # type: ignore[assignment]
-            outputs["pi_final"] = pred_metrics.pi_final  # type: ignore[assignment]
+            if pred_metrics.epsilon_final is not None:
+                outputs["epsilon_final"] = pred_metrics.epsilon_final  # type: ignore[assignment]
+                outputs["pi_final"] = pred_metrics.pi_final  # type: ignore[assignment]
             if pred_metrics.pred_error_norms:
                 outputs["pred_error_norm"] = torch.stack(pred_metrics.pred_error_norms).mean()
                 outputs["precision_mean"] = torch.stack(pred_metrics.precision_means).mean()
+            if pred_metrics.routing_logits_H is not None:
+                outputs["routing_logits_H"] = pred_metrics.routing_logits_H  # type: ignore[assignment]
+                outputs["routing_logits_L"] = pred_metrics.routing_logits_L  # type: ignore[assignment]
 
         # --- 3. Halting logic ---
         with torch.no_grad():
