@@ -26,7 +26,12 @@ from omegaconf import DictConfig
 from torch import nn
 from torch.utils.data import DataLoader
 
-from coral.training.adam_atan2 import AdamATan2
+try:
+    from adam_atan2_pytorch import AdamAtan2 as AdamATan2
+    FUSED_ADAM_ATAN2 = True
+except ImportError:
+    from coral.training.adam_atan2 import AdamATan2
+    FUSED_ADAM_ATAN2 = False
 
 from coral.data.puzzle_dataset import PuzzleDatasetMetadata, create_dataloader
 from coral.models.coral_base import CoralConfig
@@ -155,7 +160,7 @@ def build_optimizers(model: nn.Module, config: TrainConfig, world_size: int):
         optimizers.append(
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.puzzle_emb.buffers(),  # type: ignore[operator]
-                lr=0,
+                lr=1e-30,  # Near-zero init; actual LR set by scheduler.
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size,
             )
@@ -166,7 +171,7 @@ def build_optimizers(model: nn.Module, config: TrainConfig, world_size: int):
     optimizers.append(
         AdamATan2(
             model.parameters(),
-            lr=0,
+            lr=1e-30,  # Near-zero init; actual LR set by scheduler.
             weight_decay=config.weight_decay,
             betas=(config.beta1, config.beta2),
         )
@@ -380,6 +385,10 @@ def main(hydra_config: DictConfig) -> None:
         config.checkpoint_path = os.path.join(
             "checkpoints", config.project_name, config.run_name
         )
+
+    if RANK == 0:
+        backend = "fused CUDA" if FUSED_ADAM_ATAN2 else "pure PyTorch"
+        print(f"[CORAL-v3] AdamATan2 backend: {backend}")
 
     torch.manual_seed(config.seed + RANK)
 
