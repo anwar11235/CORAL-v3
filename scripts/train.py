@@ -186,7 +186,7 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
             model = ACTLossHead(inner_model, loss_type=config.loss_type)
 
         if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=False)  # type: ignore[assignment]
+            model = torch.compile(model, dynamic=config.use_columnar_routing)  # type: ignore[assignment]
 
         if world_size > 1:
             with torch.no_grad():
