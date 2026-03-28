@@ -171,13 +171,16 @@ class CrystallizationBuffer:
             keys:   [B, proj_dim*2] — recognition keys (may be on any device).
             values: [B, l_dim]      — pooled converged L-states (mean over seq dim).
         """
-        for k, v in zip(keys.detach().cpu(), values.detach().cpu()):
+        keys_cpu = keys.detach().cpu()
+        values_cpu = values.detach().cpu()
+        B = keys_cpu.shape[0]
+        for i in range(B):
             if len(self.keys) < self.capacity:
-                self.keys.append(k)
-                self.values.append(v)
+                self.keys.append(keys_cpu[i])
+                self.values.append(values_cpu[i])
             else:
-                self.keys[self.pointer] = k
-                self.values[self.pointer] = v
+                self.keys[self.pointer] = keys_cpu[i]
+                self.values[self.pointer] = values_cpu[i]
             self.pointer = (self.pointer + 1) % self.capacity
 
     def __len__(self) -> int:

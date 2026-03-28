@@ -205,12 +205,20 @@ class CoralV3Inner(CoralInner):
 
         return True, z_H, z_L, conf_mean
 
-    def _maybe_record_crystal(self, z_H: torch.Tensor, z_L: torch.Tensor) -> None:
+    def _maybe_record_crystal(
+        self, z_H: torch.Tensor, z_L: torch.Tensor, is_last_h: bool = False
+    ) -> None:
         """Add current (z_H, z_L) to the crystal buffer during training.
+
+        Only records on the last H-cycle before the 1-step-grad section to
+        avoid redundant recognition-network forward passes and CPU transfers
+        on every H-cycle (16× overhead across ACT segments).
 
         Called after each non-last H-cycle's H update (still inside no_grad).
         The buffer stores CPU tensors; detachment and CPU transfer happen inside add().
         """
+        if not is_last_h:
+            return
         if not self.config.use_crystallization or not self.training:
             return
         key = self.recognition_net.compute_key(z_H, z_L)   # [B, proj_dim*2]
@@ -325,7 +333,9 @@ class CoralV3Inner(CoralInner):
 
                 if not (h_step == self.config.H_cycles - 1):
                     z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
-                    self._maybe_record_crystal(z_H, z_L)
+                    self._maybe_record_crystal(
+                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                    )
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
@@ -397,7 +407,9 @@ class CoralV3Inner(CoralInner):
 
                 if not (h_step == self.config.H_cycles - 1):
                     z_H = self.H_level(z_H, xi, cos_sin=cos_sin)  # type: ignore[possibly-undefined]
-                    self._maybe_record_crystal(z_H, z_L)
+                    self._maybe_record_crystal(
+                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                    )
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
@@ -469,7 +481,9 @@ class CoralV3Inner(CoralInner):
 
                 if not (h_step == self.config.H_cycles - 1):
                     z_H, _ = self.H_level(z_H, z_L, cos_sin=cos_sin)
-                    self._maybe_record_crystal(z_H, z_L)
+                    self._maybe_record_crystal(
+                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                    )
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
@@ -543,7 +557,9 @@ class CoralV3Inner(CoralInner):
 
                 if not (h_step == self.config.H_cycles - 1):
                     z_H, _ = self.H_level(z_H, xi, cos_sin=cos_sin)  # type: ignore[possibly-undefined]
-                    self._maybe_record_crystal(z_H, z_L)
+                    self._maybe_record_crystal(
+                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                    )
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
