@@ -20,6 +20,9 @@ import hydra
 import pydantic
 import torch
 import torch.distributed as dist
+
+# Suppress recompile-limit warnings from variable sub-batch sizes in columnar routing
+torch._dynamo.config.recompile_limit = 64
 import tqdm
 import wandb
 from omegaconf import DictConfig
@@ -81,8 +84,8 @@ class TrainConfig(pydantic.BaseModel):
     use_columnar_routing: bool = False
     num_columns: int = 8
     active_columns: int = 2
-    lambda_balance: float = 0.01
-    column_warmup_steps: int = 5000   # steps to anneal from start_k → active_columns; 0 = skip
+    lambda_balance: float = 0.1
+    column_warmup_steps: int = 10000  # steps to anneal from start_k → active_columns; 0 = skip
     column_warmup_start_k: int = 8    # k at step 0 (defaults to S = num_columns)
 
     # Phase 3: recognition-gated crystallization

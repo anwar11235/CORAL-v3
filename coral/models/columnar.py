@@ -106,10 +106,13 @@ class ColumnarTransformerBlock(nn.Module):
 
         result = torch.zeros_like(hidden_states)  # [B, seq, D]
 
-        for s in range(self.S):
+        # Only iterate over columns that actually have assigned samples.
+        # With k=2 and S=8 this gives ≤ k*B unique column IDs (at most S distinct),
+        # avoiding the 8-iteration loop with 6 empty passes after warmup.
+        active_cols = flat_idx.unique()
+        for s_tensor in active_cols:
+            s = s_tensor.item()
             col_mask = flat_idx == s
-            if not col_mask.any():
-                continue
             entries = col_mask.nonzero(as_tuple=True)[0]   # indices into flat arrays
             src_samples = sample_idx[entries]               # [n] — which batch samples
             src_weights = flat_weights[entries]             # [n]
