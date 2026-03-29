@@ -127,7 +127,7 @@ class RecognitionNetwork(nn.Module):
         nearest_code = self.codebook[nearest_idx]  # [B, l_dim]
 
         # Expand to sequence length (each sequence position gets the same codebook vector)
-        nearest_code = nearest_code.unsqueeze(1).expand(-1, z_L.shape[1], -1)  # [B, seq, l_dim]
+        nearest_code = nearest_code.unsqueeze(1).expand(-1, z_L.shape[1], -1).contiguous()  # [B, seq, l_dim]
 
         # Confidence prediction from context + match quality
         conf_input = torch.cat(

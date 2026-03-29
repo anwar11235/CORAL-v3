@@ -266,8 +266,15 @@ class CoralV3ACT(nn.Module):
             for k, v in carry.current_data.items()
         }
 
+        # Determine whether any sequence is about to reach its last ACT segment so
+        # that _maybe_record_crystal only fires once per training step instead of
+        # halt_max_steps times.  new_steps at this point is still the pre-increment
+        # value; add 1 to get the count after this segment completes.
+        _steps_before = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
+        _is_last_segment = bool((_steps_before + 1 >= self.config.halt_max_steps).any())
+
         # --- 2. Run inner model ---
-        inner_result = self.inner(new_inner_carry, new_current_data)
+        inner_result = self.inner(new_inner_carry, new_current_data, is_last_segment=_is_last_segment)
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = inner_result[:3]
 
         outputs: Dict[str, torch.Tensor] = {

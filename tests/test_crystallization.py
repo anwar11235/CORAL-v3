@@ -321,7 +321,8 @@ def test_crystal_training_buffer_records():
     )
     model.train()
     carry = make_inner_carry(model)
-    model(carry, make_batch())
+    # is_last_segment=True simulates the final ACT segment; recording is gated on this flag
+    model(carry, make_batch(), is_last_segment=True)
     # H_cycles=2 → 1 non-last H cycle → 1 recording (B=4 entries)
     assert len(model.crystal_buffer) > 0
 

@@ -148,6 +148,7 @@ class CoralV3Inner(CoralInner):
     # Crystallization helpers
     # ------------------------------------------------------------------
 
+    @torch.compiler.disable(recursive=False)
     def _maybe_crystal_bypass_nograd(
         self,
         h_step: int,
@@ -205,19 +206,24 @@ class CoralV3Inner(CoralInner):
 
         return True, z_H, z_L, conf_mean
 
+    @torch.compiler.disable(recursive=False)
     def _maybe_record_crystal(
-        self, z_H: torch.Tensor, z_L: torch.Tensor, is_last_h: bool = False
+        self,
+        z_H: torch.Tensor,
+        z_L: torch.Tensor,
+        is_last_h: bool = False,
+        is_last_segment: bool = False,
     ) -> None:
         """Add current (z_H, z_L) to the crystal buffer during training.
 
-        Only records on the last H-cycle before the 1-step-grad section to
-        avoid redundant recognition-network forward passes and CPU transfers
-        on every H-cycle (16× overhead across ACT segments).
+        Only records on the last H-cycle of the last ACT segment to avoid
+        redundant recognition-network forward passes and GPU→CPU transfers
+        at every segment (would be halt_max_steps × per training step otherwise).
 
         Called after each non-last H-cycle's H update (still inside no_grad).
         The buffer stores CPU tensors; detachment and CPU transfer happen inside add().
         """
-        if not is_last_h:
+        if not is_last_h or not is_last_segment:
             return
         if not self.config.use_crystallization or not self.training:
             return
@@ -225,6 +231,7 @@ class CoralV3Inner(CoralInner):
         pooled_z_L = z_L.mean(dim=1)                        # [B, l_dim]
         self.crystal_buffer.add(key, pooled_z_L)
 
+    @torch.compiler.disable(recursive=False)
     def _compute_crystal_supervision_loss(
         self, z_H: torch.Tensor, z_L_final: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -265,8 +272,15 @@ class CoralV3Inner(CoralInner):
         self,
         carry: InnerCarry,
         batch: Dict[str, torch.Tensor],
+        is_last_segment: bool = False,
     ) -> Tuple:
         """Run one segment with the enabled mechanisms.
+
+        Args:
+            is_last_segment: True when this is the final ACT segment for at least
+                one sequence in the batch.  Controls whether _maybe_record_crystal
+                writes to the ring buffer — recording only on the last segment avoids
+                halt_max_steps redundant GPU→CPU transfers per training step.
 
         Returns:
             3-tuple when all mechanisms are disabled (same as CoralInner):
@@ -281,14 +295,14 @@ class CoralV3Inner(CoralInner):
         if not pc and not cr and not cry:
             return super().forward(carry, batch)
         elif pc and cr:
-            return self._forward_with_pc_and_routing(carry, batch)
+            return self._forward_with_pc_and_routing(carry, batch, is_last_segment=is_last_segment)
         elif pc:
-            return self._forward_with_pc(carry, batch)
+            return self._forward_with_pc(carry, batch, is_last_segment=is_last_segment)
         elif cr:
-            return self._forward_with_routing(carry, batch)
+            return self._forward_with_routing(carry, batch, is_last_segment=is_last_segment)
         else:
             # cry=True, pc=False, cr=False
-            return self._forward_baseline(carry, batch)
+            return self._forward_baseline(carry, batch, is_last_segment=is_last_segment)
 
     # ------------------------------------------------------------------
     # Forward implementations
@@ -298,6 +312,7 @@ class CoralV3Inner(CoralInner):
         self,
         carry: InnerCarry,
         batch: Dict[str, torch.Tensor],
+        is_last_segment: bool = False,
     ) -> Tuple[InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PredMetrics]:
         """Baseline inner forward (no PC, no routing) with crystallization support."""
         cos_sin = self._cos_sin()
@@ -334,7 +349,9 @@ class CoralV3Inner(CoralInner):
                 if not (h_step == self.config.H_cycles - 1):
                     z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
                     self._maybe_record_crystal(
-                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                        z_H, z_L,
+                        is_last_h=(h_step == self.config.H_cycles - 2),
+                        is_last_segment=is_last_segment,
                     )
 
         assert not z_H.requires_grad and not z_L.requires_grad
@@ -363,6 +380,7 @@ class CoralV3Inner(CoralInner):
         self,
         carry: InnerCarry,
         batch: Dict[str, torch.Tensor],
+        is_last_segment: bool = False,
     ) -> Tuple[InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PredMetrics]:
         """Inner forward with predictive coding (and optional crystallization)."""
         cos_sin = self._cos_sin()
@@ -408,7 +426,9 @@ class CoralV3Inner(CoralInner):
                 if not (h_step == self.config.H_cycles - 1):
                     z_H = self.H_level(z_H, xi, cos_sin=cos_sin)  # type: ignore[possibly-undefined]
                     self._maybe_record_crystal(
-                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                        z_H, z_L,
+                        is_last_h=(h_step == self.config.H_cycles - 2),
+                        is_last_segment=is_last_segment,
                     )
 
         assert not z_H.requires_grad and not z_L.requires_grad
@@ -446,6 +466,7 @@ class CoralV3Inner(CoralInner):
         self,
         carry: InnerCarry,
         batch: Dict[str, torch.Tensor],
+        is_last_segment: bool = False,
     ) -> Tuple[InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PredMetrics]:
         """Inner forward with columnar routing (and optional crystallization)."""
         cos_sin = self._cos_sin()
@@ -482,7 +503,9 @@ class CoralV3Inner(CoralInner):
                 if not (h_step == self.config.H_cycles - 1):
                     z_H, _ = self.H_level(z_H, z_L, cos_sin=cos_sin)
                     self._maybe_record_crystal(
-                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                        z_H, z_L,
+                        is_last_h=(h_step == self.config.H_cycles - 2),
+                        is_last_segment=is_last_segment,
                     )
 
         assert not z_H.requires_grad and not z_L.requires_grad
@@ -513,6 +536,7 @@ class CoralV3Inner(CoralInner):
         self,
         carry: InnerCarry,
         batch: Dict[str, torch.Tensor],
+        is_last_segment: bool = False,
     ) -> Tuple[InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PredMetrics]:
         """Inner forward with both predictive coding and columnar routing (and optional crystallization)."""
         cos_sin = self._cos_sin()
@@ -558,7 +582,9 @@ class CoralV3Inner(CoralInner):
                 if not (h_step == self.config.H_cycles - 1):
                     z_H, _ = self.H_level(z_H, xi, cos_sin=cos_sin)  # type: ignore[possibly-undefined]
                     self._maybe_record_crystal(
-                        z_H, z_L, is_last_h=(h_step == self.config.H_cycles - 2)
+                        z_H, z_L,
+                        is_last_h=(h_step == self.config.H_cycles - 2),
+                        is_last_segment=is_last_segment,
                     )
 
         assert not z_H.requires_grad and not z_L.requires_grad
