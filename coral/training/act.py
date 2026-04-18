@@ -311,6 +311,10 @@ class CoralV3ACT(nn.Module):
                     device=logits.device,
                     dtype=torch.float32,
                 )
+                if pred_metrics.crystal_reconstruction_error is not None:
+                    outputs["crystal_reconstruction_error"] = pred_metrics.crystal_reconstruction_error.to(logits.device)
+                if pred_metrics.crystal_target_confidence_mean is not None:
+                    outputs["crystal_target_confidence_mean"] = pred_metrics.crystal_target_confidence_mean.to(logits.device)
 
         # --- 3. Halting logic ---
         with torch.no_grad():

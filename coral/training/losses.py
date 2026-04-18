@@ -448,7 +448,12 @@ class CoralV3LossHead(nn.Module):
             metrics["crystal_supervision_loss"] = crystal_loss.detach()
 
         # Log crystal bypass count and any other crystal scalars
-        for key in ("crystal_bypass_count", "crystal_confidence_mean"):
+        for key in (
+            "crystal_bypass_count",
+            "crystal_confidence_mean",
+            "crystal_reconstruction_error",
+            "crystal_target_confidence_mean",
+        ):
             if key in outputs:
                 val = outputs[key]
                 metrics[key] = val.detach() if isinstance(val, torch.Tensor) else val

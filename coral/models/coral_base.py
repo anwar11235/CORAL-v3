@@ -81,6 +81,7 @@ class CoralConfig(BaseModel):
     crystal_confidence_threshold: float = 0.8  # bypass fires when mean(confidence) > threshold
     crystal_buffer_capacity: int = 10000  # ring-buffer capacity for consolidation
     crystal_consolidation_interval: int = 10   # epochs between consolidation calls
+    crystal_bootstrap_steps: int = 5000    # steps before first consolidation / gate supervision
     lambda_crystal: float = 0.1           # weight for crystallization supervision loss
 
 

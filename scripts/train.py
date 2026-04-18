@@ -95,7 +95,11 @@ class TrainConfig(pydantic.BaseModel):
     crystal_confidence_threshold: float = 0.8
     crystal_buffer_capacity: int = 10000
     crystal_consolidation_interval: int = 5000  # steps between codebook consolidations; 0 = never
+    crystal_bootstrap_steps: int = 5000    # steps before first consolidation / gate supervision
     lambda_crystal: float = 0.1
+
+    # Warm-start
+    resume_from_checkpoint: Optional[str] = None  # path to a .pt state_dict to warm-start from
 
     # Loss
     loss_type: str = "stablemax_cross_entropy"
@@ -175,6 +179,8 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
         crystal_proj_dim=config.crystal_proj_dim,
         crystal_confidence_threshold=config.crystal_confidence_threshold,
         crystal_buffer_capacity=config.crystal_buffer_capacity,
+        crystal_consolidation_interval=config.crystal_consolidation_interval,
+        crystal_bootstrap_steps=config.crystal_bootstrap_steps,
         lambda_crystal=config.lambda_crystal,
     )
 
@@ -469,6 +475,67 @@ def save_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# Warm-start checkpoint loading
+# ---------------------------------------------------------------------------
+
+
+def load_warmstart_checkpoint(
+    state: TrainState,
+    checkpoint_path: str,
+    rank: int,
+) -> TrainState:
+    """Warm-start model weights from a checkpoint, ignoring missing keys.
+
+    Designed for cross-phase warm-starts (e.g., Phase 1 → Phase 3) where the
+    source checkpoint does not contain crystallization module weights.  Uses
+    strict=False so only the keys present in the checkpoint are loaded; new
+    modules (RecognitionNetwork, CrystallizationBuffer parameters) keep their
+    random initialisation.
+
+    Optimizer state is NOT restored — optimizers always start fresh.  This is
+    correct for cross-phase warm-starts where the parameter set has changed.
+
+    Args:
+        state:           Current TrainState (model already built).
+        checkpoint_path: Path to a .pt file saved via torch.save(model.state_dict()).
+        rank:            Current process rank (logging only on rank 0).
+
+    Returns:
+        The same TrainState with model weights partially loaded.
+    """
+    if rank == 0:
+        print(f"[CORAL-v3] Warm-starting from checkpoint: {checkpoint_path}")
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+
+    # torch.compile wraps the model — access underlying module for load_state_dict
+    target_model = state.model
+    if hasattr(target_model, "_orig_mod"):
+        target_model = target_model._orig_mod  # type: ignore[attr-defined]
+
+    result = target_model.load_state_dict(ckpt, strict=False)
+
+    if rank == 0:
+        if result.missing_keys:
+            print(
+                f"[CORAL-v3] Warm-start: {len(result.missing_keys)} keys not in checkpoint "
+                f"(expected for new modules):"
+            )
+            for k in sorted(result.missing_keys):
+                print(f"  MISSING  {k}")
+        if result.unexpected_keys:
+            print(
+                f"[CORAL-v3] Warm-start: {len(result.unexpected_keys)} unexpected keys "
+                f"(checkpoint has keys not in current model — verify this is intentional):"
+            )
+            for k in sorted(result.unexpected_keys):
+                print(f"  UNEXPECTED  {k}")
+        print("[CORAL-v3] Warm-start complete.")
+
+    return state
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -537,6 +604,11 @@ def main(hydra_config: DictConfig) -> None:
 
     state = init_train_state(config, train_meta, world_size=WORLD_SIZE)
 
+    # Warm-start: load backbone weights from a prior-phase checkpoint.
+    # Missing keys (new modules like RecognitionNetwork) are expected and logged.
+    if config.resume_from_checkpoint:
+        state = load_warmstart_checkpoint(state, config.resume_from_checkpoint, RANK)
+
     if RANK == 0:
         wandb.init(
             project=config.project_name,
@@ -552,6 +624,14 @@ def main(hydra_config: DictConfig) -> None:
     best_checkpoint_path: Optional[str] = None
     latest_checkpoint_path: Optional[str] = None
 
+    # Bootstrap-phase state — persists across eval checkpoints.
+    # first_consolidation_done tracks whether the first full-replace consolidation
+    # has succeeded; until then the crystal gate receives no BCE supervision.
+    first_consolidation_done: bool = False
+    # When crystal_bootstrap_steps == 0 the gate is active from step 0 (backward compat).
+    if config.use_crystallization and config.crystal_bootstrap_steps == 0:
+        first_consolidation_done = True
+
     for _iter in range(total_iters):
         if RANK == 0:
             print(f"[CORAL-v3] Epoch {_iter * eval_interval}")
@@ -564,18 +644,48 @@ def main(hydra_config: DictConfig) -> None:
                 wandb.log(metrics, step=state.step)
                 pbar.update(state.step - pbar.n)  # type: ignore[operator]
 
-            # Crystallization codebook consolidation
-            if (
-                config.use_crystallization
-                and config.crystal_consolidation_interval > 0
-                and state.step % config.crystal_consolidation_interval == 0
-            ):
+            if config.use_crystallization:
+                # --- Crystal bootstrap-phase monitoring ---
                 inner = state.model.model.inner  # type: ignore[attr-defined]
-                usage = inner.consolidate_codebook()
+
+                # Log buffer fill and phase indicator every step (cheap scalars)
                 if RANK == 0:
-                    print(f"[CORAL-v3] Codebook consolidation at step {state.step}")
-                    if usage is not None:
-                        wandb.log({"train/codebook_usage": usage}, step=state.step)
+                    buf_fill = len(inner.crystal_buffer) / max(inner.crystal_buffer.capacity, 1)
+                    wandb.log(
+                        {
+                            "train/crystal/buffer_fill": buf_fill,
+                            "train/crystal/first_consolidation_done": float(first_consolidation_done),
+                        },
+                        step=state.step,
+                    )
+
+                # --- Consolidation trigger ---
+                # First consolidation fires at crystal_bootstrap_steps (with full replace).
+                # Subsequent consolidations fire every crystal_consolidation_interval steps.
+                should_consolidate = (
+                    config.crystal_consolidation_interval > 0
+                    and state.step >= config.crystal_bootstrap_steps
+                    and (state.step - config.crystal_bootstrap_steps)
+                        % config.crystal_consolidation_interval == 0
+                )
+                if should_consolidate:
+                    is_first = not first_consolidation_done
+                    usage = inner.consolidate_codebook(is_first_consolidation=is_first)
+                    if RANK == 0:
+                        print(
+                            f"[CORAL-v3] Codebook consolidation at step {state.step}"
+                            f" (first={is_first}, usage={usage})"
+                        )
+                    if usage is not None and not first_consolidation_done:
+                        first_consolidation_done = True
+                        inner._crystal_gate_active = True
+                        if RANK == 0:
+                            print("[CORAL-v3] Crystal gate activated — BCE supervision enabled.")
+                    if usage is not None and RANK == 0:
+                        wandb.log(
+                            {"train/crystal/codebook_utilisation_frac": usage},
+                            step=state.step,
+                        )
 
         # ---- Eval ----
         state.model.eval()

@@ -42,6 +42,7 @@ from coral.models.columnar import ColumnarReasoningModule
 from coral.models.crystallization import (
     CrystallizationBuffer,
     RecognitionNetwork,
+    crystallization_diagnostics,
     crystallization_supervision_loss,
 )
 from coral.models.prediction import PredictionNet, PrecisionNet
@@ -87,6 +88,8 @@ class PredMetrics:
     crystal_supervision_loss_final: Optional[torch.Tensor] = field(default=None)
     crystal_bypass_count: int = field(default=0)
     crystal_confidence_mean: float = field(default=0.0)
+    crystal_reconstruction_error: Optional[torch.Tensor] = field(default=None)
+    crystal_target_confidence_mean: Optional[torch.Tensor] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,13 @@ class CoralV3Inner(CoralInner):
 
     def __init__(self, config: CoralConfig) -> None:
         super().__init__(config)
+
+        # Gate activation flag — False during bootstrap phase, True afterwards.
+        # Set externally by the training loop after the first codebook consolidation.
+        # When False, crystallization_supervision_loss is suppressed (gate receives no
+        # BCE gradient) so the random codebook cannot poison the confidence head before
+        # real codebook entries exist.
+        self._crystal_gate_active: bool = config.crystal_bootstrap_steps == 0
 
         # --- Phase 1: predictive coding ---
         if config.use_predictive_coding:
@@ -234,34 +244,60 @@ class CoralV3Inner(CoralInner):
     @torch.compiler.disable(recursive=False)
     def _compute_crystal_supervision_loss(
         self, z_H: torch.Tensor, z_L_final: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Compute the crystallization supervision loss in the 1-step-grad section.
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute crystallization supervision loss and reconstruction diagnostics.
 
-        Called AFTER the final L update and BEFORE the final H update, so z_H
-        is the H-state that the recognition network would see at inference time
-        at the start of this H-cycle.
+        Called AFTER the final L update and BEFORE the final H update.
 
-        Returns None when not training or crystallization is disabled.
+        Returns:
+            (bce_loss, mean_reconstruction_error, target_confidence_mean)
+
+            bce_loss is None during the bootstrap phase (gate not active) or
+            during eval — gate receives no BCE gradient until _crystal_gate_active
+            is True.  Diagnostics are computed whenever crystallization is enabled,
+            giving visibility into codebook quality before the gate goes live.
+
+            All three are None when use_crystallization is False.
         """
-        if not self.config.use_crystallization or not self.training:
-            return None
-        return crystallization_supervision_loss(self.recognition_net, z_H, z_L_final)
+        if not self.config.use_crystallization:
+            return None, None, None
 
-    def consolidate_codebook(self) -> Optional[float]:
+        if self.training and self._crystal_gate_active:
+            bce_loss, mean_recon, target_conf = crystallization_supervision_loss(
+                self.recognition_net, z_H, z_L_final
+            )
+            return bce_loss, mean_recon, target_conf
+
+        # Bootstrap phase (training, gate not active) or eval: diagnostics only
+        mean_recon, target_conf = crystallization_diagnostics(
+            self.recognition_net, z_H, z_L_final
+        )
+        return None, mean_recon, target_conf
+
+    def consolidate_codebook(self, is_first_consolidation: bool = False) -> Optional[float]:
         """Offline codebook update — call periodically from the training loop.
 
         Runs k-means-like assignment + EMA on the crystal buffer, then clears it.
-        Typically called every N training steps.
+
+        Args:
+            is_first_consolidation: When True, requires 80% buffer fill and uses
+                                    ema_weight=1.0 (full replace of random init).
+                                    Returns None to defer if buffer is not full enough.
 
         Returns:
-            Fraction of codebook entries that had at least one assignment in the
-            final k-means iteration, or None if the buffer was too small to consolidate.
+            Fraction of codebook entries with at least one assignment, or None
+            if the buffer was too small to consolidate.
         """
         if not self.config.use_crystallization:
             return None
         device = str(next(self.recognition_net.parameters()).device)
-        usage = self.crystal_buffer.consolidate(self.recognition_net, device=device)
-        self.crystal_buffer.clear()
+        usage = self.crystal_buffer.consolidate(
+            self.recognition_net,
+            device=device,
+            is_first_consolidation=is_first_consolidation,
+        )
+        if usage is not None:
+            self.crystal_buffer.clear()
         return usage
 
     # ------------------------------------------------------------------
@@ -358,7 +394,7 @@ class CoralV3Inner(CoralInner):
 
         # 1-step gradient
         z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
-        crystal_loss_final = self._compute_crystal_supervision_loss(z_H, z_L)
+        crystal_loss_final, crystal_recon_err, crystal_tgt_conf = self._compute_crystal_supervision_loss(z_H, z_L)
         z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
 
         new_carry = InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
@@ -373,6 +409,8 @@ class CoralV3Inner(CoralInner):
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
             crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
+            crystal_reconstruction_error=crystal_recon_err,
+            crystal_target_confidence_mean=crystal_tgt_conf,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
 
@@ -440,7 +478,7 @@ class CoralV3Inner(CoralInner):
         pi_final = self.precision_net(z_L)
         xi = pi_final * epsilon_final
 
-        crystal_loss_final = self._compute_crystal_supervision_loss(z_H, z_L)
+        crystal_loss_final, crystal_recon_err, crystal_tgt_conf = self._compute_crystal_supervision_loss(z_H, z_L)
 
         z_H = self.H_level(z_H, xi, cos_sin=cos_sin)
 
@@ -459,6 +497,8 @@ class CoralV3Inner(CoralInner):
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
             crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
+            crystal_reconstruction_error=crystal_recon_err,
+            crystal_target_confidence_mean=crystal_tgt_conf,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
 
@@ -512,7 +552,7 @@ class CoralV3Inner(CoralInner):
 
         # 1-step gradient — collect routing logits
         z_L, routing_logits_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
-        crystal_loss_final = self._compute_crystal_supervision_loss(z_H, z_L)
+        crystal_loss_final, crystal_recon_err, crystal_tgt_conf = self._compute_crystal_supervision_loss(z_H, z_L)
         z_H, routing_logits_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
 
         new_carry = InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
@@ -529,6 +569,8 @@ class CoralV3Inner(CoralInner):
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
             crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
+            crystal_reconstruction_error=crystal_recon_err,
+            crystal_target_confidence_mean=crystal_tgt_conf,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics
 
@@ -596,7 +638,7 @@ class CoralV3Inner(CoralInner):
         pi_final = self.precision_net(z_L)
         xi = pi_final * epsilon_final
 
-        crystal_loss_final = self._compute_crystal_supervision_loss(z_H, z_L)
+        crystal_loss_final, crystal_recon_err, crystal_tgt_conf = self._compute_crystal_supervision_loss(z_H, z_L)
 
         z_H, routing_logits_H = self.H_level(z_H, xi, cos_sin=cos_sin)
 
@@ -617,5 +659,7 @@ class CoralV3Inner(CoralInner):
             crystal_supervision_loss_final=crystal_loss_final,
             crystal_bypass_count=crystal_bypassed,
             crystal_confidence_mean=_conf_total / _conf_steps if _conf_steps > 0 else 0.0,
+            crystal_reconstruction_error=crystal_recon_err,
+            crystal_target_confidence_mean=crystal_tgt_conf,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics

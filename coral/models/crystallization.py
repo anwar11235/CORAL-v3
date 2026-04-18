@@ -19,7 +19,7 @@ Components:
   crystallization_supervision_loss — BCE loss that trains the confidence gate
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -191,26 +191,27 @@ class CrystallizationBuffer:
         recognition_net: RecognitionNetwork,
         num_iterations: int = 100,
         device: str = "cpu",
+        is_first_consolidation: bool = False,
     ) -> Optional[float]:
         """Update the codebook via offline k-means-like assignment + EMA.
 
-        Requires at least 100 stored pairs; silently returns None otherwise.
-
-        Each stored (key, value) pair is assigned to the nearest codebook key
-        by cosine similarity.  For each cluster, the codebook entry (both value
-        and key) is updated via EMA:
-            new_entry = 0.9 * old_entry + 0.1 * cluster_mean
-
         Args:
-            recognition_net: The RecognitionNetwork whose codebook to update.
-            num_iterations:  Number of assignment + update rounds.
-            device:          Device to use for the computation (should match
-                             recognition_net's parameter device).
+            recognition_net:       The RecognitionNetwork whose codebook to update.
+            num_iterations:        Number of assignment + update rounds.
+            device:                Device to use for the computation.
+            is_first_consolidation: When True, requires the buffer to be at least
+                                   80% full before proceeding (returns None to defer
+                                   if not), and uses ema_weight=1.0 (full replace)
+                                   so the random initialisation is discarded entirely.
+                                   When False, uses ema_weight=0.1 (standard EMA).
 
         Returns:
             Fraction of codebook entries that received at least one assignment
             in the final iteration, or None if the buffer was too small.
         """
+        if is_first_consolidation and len(self.keys) < int(0.8 * self.capacity):
+            return None
+
         if len(self.keys) < 100:
             return None
 
@@ -218,6 +219,8 @@ class CrystallizationBuffer:
         all_values = torch.stack(self.values).to(device)  # [N, l_dim]
 
         K = recognition_net.codebook.shape[0]
+        ema_weight = 1.0 if is_first_consolidation else 0.1
+        keep_weight = 1.0 - ema_weight
         assignments: Optional[torch.Tensor] = None
 
         with torch.no_grad():
@@ -237,10 +240,12 @@ class CrystallizationBuffer:
                         mean_value = all_values[mask].mean(dim=0)
                         mean_key = all_keys[mask].mean(dim=0)
                         recognition_net.codebook.data[k_idx] = (
-                            0.9 * recognition_net.codebook.data[k_idx] + 0.1 * mean_value
+                            keep_weight * recognition_net.codebook.data[k_idx]
+                            + ema_weight * mean_value
                         )
                         recognition_net.codebook_keys.data[k_idx] = (
-                            0.9 * recognition_net.codebook_keys.data[k_idx] + 0.1 * mean_key
+                            keep_weight * recognition_net.codebook_keys.data[k_idx]
+                            + ema_weight * mean_key
                         )
 
         # Codebook usage: fraction of K entries with at least one assignment
@@ -266,7 +271,7 @@ def crystallization_supervision_loss(
     z_H: torch.Tensor,
     z_L_converged: torch.Tensor,
     tolerance: float = 0.05,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Train the confidence gate to predict when crystallization bypass is safe.
 
     Called after each full L-cycle during training (in the 1-step-grad section
@@ -283,7 +288,8 @@ def crystallization_supervision_loss(
         tolerance:        Mean-squared reconstruction error threshold for "safe" bypass.
 
     Returns:
-        Scalar BCE loss.
+        (bce_loss, mean_reconstruction_error, target_confidence_mean)
+        The last two are detached scalars for logging.
     """
     confidence, nearest_code, _ = recognition_net(z_H, z_L_converged)
 
@@ -291,5 +297,36 @@ def crystallization_supervision_loss(
     with torch.no_grad():
         reconstruction_error = (z_L_converged - nearest_code).pow(2).mean(dim=(1, 2))  # [B]
         target_confidence = (reconstruction_error < tolerance).float()
+        mean_recon_error = reconstruction_error.mean()
+        target_conf_mean = target_confidence.mean()
 
-    return F.binary_cross_entropy(confidence, target_confidence)
+    bce_loss = F.binary_cross_entropy(confidence, target_confidence)
+    return bce_loss, mean_recon_error, target_conf_mean
+
+
+def crystallization_diagnostics(
+    recognition_net: RecognitionNetwork,
+    z_H: torch.Tensor,
+    z_L_converged: torch.Tensor,
+    tolerance: float = 0.05,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute reconstruction diagnostics without training a BCE loss.
+
+    Used during the bootstrap phase (gate not yet active) and at eval time to
+    track how well the codebook matches converged L-states, even when gate
+    supervision is suppressed.
+
+    Args:
+        recognition_net:  The RecognitionNetwork.
+        z_H:              [B, seq_len, h_dim]
+        z_L_converged:    [B, seq_len, l_dim] — actual converged L-state.
+        tolerance:        MSE threshold for "safe" bypass.
+
+    Returns:
+        (mean_reconstruction_error, target_confidence_mean) — detached scalars.
+    """
+    with torch.no_grad():
+        _, nearest_code, _ = recognition_net(z_H, z_L_converged)
+        reconstruction_error = (z_L_converged - nearest_code).pow(2).mean(dim=(1, 2))  # [B]
+        target_confidence = (reconstruction_error < tolerance).float()
+    return reconstruction_error.mean(), target_confidence.mean()

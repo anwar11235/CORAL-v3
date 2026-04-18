@@ -99,7 +99,7 @@ numpy
 
 Wherever we are implementing analogs from HRM, rename those to reflect CORAL or coral. Do not use HRM in any naming or code.
 
-## Current State (Phase 0 — Steps 0.1–0.9 complete)
+## Current State (Phases 0–3 complete; Phase 3a' bootstrap fix applied)
 
 ```
 coral/
@@ -109,23 +109,57 @@ coral/
 │   ├── transformer_block.py   ✅ TransformerBlock (Post-Norm), TransformerBlockConfig
 │   ├── reasoning_module.py    ✅ ReasoningModule
 │   ├── coral_base.py          ✅ CoralInner, CoralConfig, InnerCarry
+│   │                             NEW: crystal_bootstrap_steps field
+│   ├── coral_v3.py            ✅ CoralV3Inner — Phase 1/2/3 dispatcher
+│   │                             NEW: _crystal_gate_active flag, PredMetrics diagnostic fields
+│   ├── crystallization.py     ✅ RecognitionNetwork, CrystallizationBuffer
+│   │                             NEW: consolidate(is_first_consolidation=), crystallization_diagnostics()
+│   │                             CHANGED: crystallization_supervision_loss() now returns 3-tuple
+│   ├── prediction.py          ✅ PredictionNet, PrecisionNet
+│   ├── columnar.py            ✅ ColumnarReasoningModule, ColumnarTransformerBlock
 │   └── sparse_embedding.py    ✅ CastedSparseEmbedding, CastedSparseEmbeddingSignSGD_Distributed
 ├── training/
-│   ├── losses.py              ✅ stablemax_cross_entropy, softmax_cross_entropy, ACTLossHead
-│   ├── act.py                 ✅ CoralACT, ACTCarry
+│   ├── losses.py              ✅ stablemax_cross_entropy, softmax_cross_entropy,
+│   │                             ACTLossHead, CoralV3LossHead
+│   │                             NEW: logs crystal_reconstruction_error, crystal_target_confidence_mean
+│   ├── act.py                 ✅ CoralACT, CoralV3ACT
+│   │                             NEW: forwards crystal diagnostic tensors to outputs dict
 │   └── scheduler.py           ✅ cosine_schedule_with_warmup_lr_lambda
 └── data/
     └── puzzle_dataset.py      ✅ PuzzleDataset, PuzzleDatasetMetadata, create_dataloader
 scripts/
 └── train.py                   ✅ Hydra-based training entry point
+                                  NEW: load_warmstart_checkpoint(), bootstrap-phase consolidation
+                                  logic, train/crystal/* W&B metrics
 configs/
-└── base.yaml                  ✅ Default hyperparameters
+├── base.yaml                  ✅ Default hyperparameters
+└── phase3a_crystal_warmstart.yaml  ✅ PC + crystal warm-start config for validation run
 tests/
 ├── test_layers.py             ✅
 ├── test_coral_base.py         ✅
-└── test_act.py                ✅
+├── test_act.py                ✅
+├── test_prediction.py         ✅
+├── test_columnar.py           ✅
+├── test_crystallization.py    ✅  (updated for 3-tuple supervision loss return)
+└── test_integration.py        ✅
 ```
 
-**Still needed before Phase 1:**
-- Step 0.10: Integration tests (test_forward_pass, test_1step_gradient)
-- Step 0.11: Validation run on Sudoku-Extreme-1K (target ≥50% accuracy)
+### Key Experimental Results
+
+| Run | W&B ID | Config | Final Accuracy | Status |
+|-----|--------|--------|----------------|--------|
+| calculating-caracara | kyi7327z | Baseline (pure PyTorch AdamATan2) | 41.2% | Complete |
+| defiant-raccoon | xlxm6d3x | Phase 1 (bugged pi_reg) | 14% at 20K | Killed |
+| **poetic-giraffe** | **mfno8t1y** | **Phase 1 (fixed pi_reg)** | **61.07%** | **Complete ✓** |
+| **orchid-heron** | **jrtvvvi7** | **Baseline (fused AdamATan2)** | **54.2%** | **Complete ✓** |
+| agate-cuckoo | v7cmw24l | Phase 2 (routing only, λ_bal=0.01) | 7.3% at 10K | Killed — collapsed |
+| curly-manatee | — | Phase 2 (routing only, λ_bal=0.1) | 14.69% at 15K | Killed — collapsed |
+
+### Phase 3a' — Next Validation Run
+
+Config: `configs/phase3a_crystal_warmstart.yaml`
+Warm-start from: `phase1_best_checkpoint_61pct.pt` (poetic-giraffe, 61.07%)
+Bootstrap steps: 5000 (buffer fills, no gate BCE), then first consolidation with full codebook replace.
+Success criteria: exact_accuracy ≥ 0.58, bypass_rate ≥ 0.20, codebook_utilisation ≥ 0.30.
+
+See `PHASE3A_CHANGES.md` for launch commands and metric tracking guide.

@@ -228,8 +228,13 @@ def test_crystal_supervision_loss_returns_scalar():
     rnet = make_rnet()
     z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
     z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    loss = crystallization_supervision_loss(rnet, z_H, z_L)
-    assert loss.shape == (), f"expected scalar, got {loss.shape}"
+    loss, mean_recon, target_conf = crystallization_supervision_loss(rnet, z_H, z_L)
+    assert loss.shape == (), f"expected scalar bce_loss, got {loss.shape}"
+    assert mean_recon.shape == (), f"expected scalar mean_recon_error, got {mean_recon.shape}"
+    assert target_conf.shape == (), f"expected scalar target_conf_mean, got {target_conf.shape}"
+    # Diagnostics must be detached
+    assert not mean_recon.requires_grad
+    assert not target_conf.requires_grad
 
 
 def test_crystal_supervision_loss_bounded():
@@ -238,7 +243,7 @@ def test_crystal_supervision_loss_bounded():
     for _ in range(5):
         z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
         z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-        loss = crystallization_supervision_loss(rnet, z_H, z_L)
+        loss, _, _ = crystallization_supervision_loss(rnet, z_H, z_L)
         assert loss.item() >= 0.0
 
 
@@ -246,7 +251,7 @@ def test_crystal_supervision_loss_differentiable():
     rnet = make_rnet()
     z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
     z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN, requires_grad=True)
-    loss = crystallization_supervision_loss(rnet, z_H, z_L)
+    loss, _, _ = crystallization_supervision_loss(rnet, z_H, z_L)
     loss.backward()
     # Gradient should flow through confidence head (z_H, z_L → key → confidence)
     assert z_L.grad is not None
@@ -265,9 +270,11 @@ def test_crystal_supervision_loss_perfect_codebook():
         rnet.codebook_keys.fill_(0.0)
         rnet.codebook_keys[0].fill_(1.0)
 
-    loss = crystallization_supervision_loss(rnet, z_H, z_L, tolerance=0.1)
+    loss, mean_recon, target_conf = crystallization_supervision_loss(rnet, z_H, z_L, tolerance=0.1)
     # Confidence starts ~0.5 (random init), target = 1.0 → BCE ≈ 0.69
     assert loss.item() >= 0.0
+    # With perfect codebook: reconstruction error ≈ 0, target_confidence ≈ 1
+    assert target_conf.item() >= 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -328,17 +335,35 @@ def test_crystal_training_buffer_records():
 
 
 def test_crystal_training_supervision_loss_computed():
-    """crystal_supervision_loss_final should be a non-None scalar during training."""
-    model = make_v3_model(
+    """crystal_supervision_loss_final is non-None only after the gate is activated."""
+    # With bootstrap_steps=5000 (default), gate starts inactive → loss is None during bootstrap
+    model_bootstrap = make_v3_model(
         use_crystallization=True,
         codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
     )
-    model.train()
-    carry = make_inner_carry(model)
-    _, _, _, pred_metrics = model(carry, make_batch())
-    assert pred_metrics.crystal_supervision_loss_final is not None
-    assert pred_metrics.crystal_supervision_loss_final.shape == ()
+    model_bootstrap.train()
+    carry = make_inner_carry(model_bootstrap)
+    _, _, _, pm_bootstrap = model_bootstrap(carry, make_batch())
+    assert pm_bootstrap.crystal_supervision_loss_final is None, (
+        "gate inactive during bootstrap — BCE loss should be None"
+    )
+    # Diagnostics should still be computed even during bootstrap
+    assert pm_bootstrap.crystal_reconstruction_error is not None
+    assert pm_bootstrap.crystal_target_confidence_mean is not None
+
+    # With bootstrap_steps=0, gate is active from the start → loss is non-None
+    model_active = make_v3_model(
+        use_crystallization=True,
+        codebook_size=CODEBOOK_SIZE,
+        crystal_proj_dim=PROJ_DIM,
+        crystal_bootstrap_steps=0,
+    )
+    model_active.train()
+    carry2 = make_inner_carry(model_active)
+    _, _, _, pm_active = model_active(carry2, make_batch())
+    assert pm_active.crystal_supervision_loss_final is not None
+    assert pm_active.crystal_supervision_loss_final.shape == ()
 
 
 # ---------------------------------------------------------------------------
@@ -487,10 +512,14 @@ def test_all_combinations_pred_metrics_fields(pc, cr, cry):
         assert pred_metrics.routing_logits_L is None
 
     if cry:
-        assert pred_metrics.crystal_supervision_loss_final is not None
-        assert pred_metrics.crystal_supervision_loss_final.shape == ()
+        # Gate inactive by default (bootstrap_steps=5000): diagnostics present, BCE None.
+        # Use bootstrap_steps=0 to exercise the BCE path.
+        assert pred_metrics.crystal_reconstruction_error is not None
+        assert pred_metrics.crystal_target_confidence_mean is not None
     else:
         assert pred_metrics.crystal_supervision_loss_final is None
+        assert pred_metrics.crystal_reconstruction_error is None
+        assert pred_metrics.crystal_target_confidence_mean is None
 
 
 def test_load_balancing_loss_with_crystal():
