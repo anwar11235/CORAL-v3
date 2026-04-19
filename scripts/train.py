@@ -719,6 +719,13 @@ def main(hydra_config: DictConfig) -> None:
         eval_metrics = evaluate(config, state, eval_loader, eval_meta, rank=RANK, world_size=WORLD_SIZE)
         if RANK == 0 and eval_metrics:
             flat = {f"eval/{sname}/{k}": v for sname, m in eval_metrics.items() for k, v in m.items()}
+            # Also log flat aliases (eval/<metric>) for the primary eval set ("test").
+            # This matches the naming used in Phase 1 runs (poetic-giraffe) so W&B
+            # comparison charts can overlay Phase 1 and Phase 3a'+ runs on the same axis.
+            primary = eval_metrics.get("test") or (next(iter(eval_metrics.values())) if eval_metrics else None)
+            if primary:
+                for k, v in primary.items():
+                    flat[f"eval/{k}"] = v
             wandb.log(flat, step=state.step)
 
         # ---- Checkpoint ----
