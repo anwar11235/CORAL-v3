@@ -21,6 +21,9 @@ import pydantic
 import torch
 import torch.distributed as dist
 
+# Enable TF32 tensor cores for fp32 matmuls (residual fp32 ops benefit on A100; ~1-2% speedup).
+torch.set_float32_matmul_precision("high")
+
 # Suppress recompile-limit warnings from variable sub-batch sizes in columnar routing
 # torch 2.6 uses cache_size_limit; torch 2.7+ renamed it to recompile_limit.
 if hasattr(torch._dynamo.config, "recompile_limit"):
