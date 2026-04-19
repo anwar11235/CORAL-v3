@@ -22,7 +22,11 @@ import torch
 import torch.distributed as dist
 
 # Suppress recompile-limit warnings from variable sub-batch sizes in columnar routing
-torch._dynamo.config.recompile_limit = 64
+# torch 2.6 uses cache_size_limit; torch 2.7+ renamed it to recompile_limit.
+if hasattr(torch._dynamo.config, "recompile_limit"):
+    torch._dynamo.config.recompile_limit = 64      # torch 2.7+
+else:
+    torch._dynamo.config.cache_size_limit = 64     # torch 2.6 (legacy name)
 import tqdm
 import wandb
 from omegaconf import DictConfig
