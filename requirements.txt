@@ -8,15 +8,20 @@ numpy>=1.24
 # which on A100 dispatches to FlashAttention-2 internally via cuDNN. The
 # fallback costs ~5-10% end-to-end throughput vs a standalone flash-attn install.
 #
-# To install flash-attn (requires a CUDA-capable build environment):
-#     FLASH_ATTN_CUDA_ARCHS=80 pip install flash-attn --no-build-isolation
+# Pin: 2.7.4.post1 is the last version ABI-compatible with torch 2.6.
+# flash-attn 2.8.x uses symbols absent in torch 2.6 and crashes at import.
+# Update this pin when migrating to torch 2.7+.
 #
-# For A100 only, FLASH_ATTN_CUDA_ARCHS=80 reduces build time ~4× by skipping
-# sm_90/sm_100/sm_120 kernel compilation. With the torch 2.4-2.6 pin above,
-# prebuilt wheels exist and source build may not be needed at all.
+# To install (A100-only sm_80 build, ~4× faster than full build):
+#     FLASH_ATTN_CUDA_ARCHS=80 pip install flash-attn==2.7.4.post1 --no-build-isolation
+#
+# Prebuilt wheels for torch 2.4-2.6 + CUDA 12.x are available on PyPI.
 
-# Optimizer
+# Optimizer — adam-atan2-pytorch is the fused CUDA variant; required for training perf.
+# Without it, train.py silently falls back to the pure-PyTorch AdamAtan2 implementation
+# (coral/training/adam_atan2.py) which causes severe training degradation.
 adam-atan2>=0.0.3
+adam-atan2-pytorch>=0.3.2
 
 # Config / CLI
 pydantic>=2.0

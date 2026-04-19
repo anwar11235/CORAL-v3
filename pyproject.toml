@@ -11,6 +11,7 @@ dependencies = [
     "torch>=2.4,<2.7",
     "numpy>=1.24",
     "adam-atan2>=0.0.3",
+    "adam-atan2-pytorch>=0.3.2",
     "pydantic>=2.0",
     "hydra-core>=1.3",
     "omegaconf>=2.3",
@@ -23,8 +24,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Pin tied to torch 2.6 ABI — update when migrating to torch 2.7+.
+# flash-attn 2.8.x is ABI-incompatible with torch 2.6 (undefined symbols at import).
 flash-attn = [
-    "flash-attn>=2.7,<3.0",
+    "flash-attn==2.7.4.post1",
 ]
 
 [tool.setuptools.packages.find]
