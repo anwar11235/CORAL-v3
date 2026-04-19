@@ -99,7 +99,7 @@ numpy
 
 Wherever we are implementing analogs from HRM, rename those to reflect CORAL or coral. Do not use HRM in any naming or code.
 
-## Current State (Phases 0–3 complete; Phase 3a' bootstrap fix applied)
+## Current State (Phases 0–3 complete; Phase 3a' bootstrap fix + perf fixes applied)
 
 ```
 coral/
@@ -113,6 +113,8 @@ coral/
 │   ├── coral_v3.py            ✅ CoralV3Inner — Phase 1/2/3 dispatcher
 │   │                             NEW: _crystal_gate_active flag, PredMetrics diagnostic fields
 │   ├── crystallization.py     ✅ RecognitionNetwork, CrystallizationBuffer
+│   │                             PERF: CrystallizationBuffer rewritten with pre-allocated tensors;
+│   │                             vectorised add() eliminates Python loop (fixes ~11×/step slowdown)
 │   │                             NEW: consolidate(is_first_consolidation=), crystallization_diagnostics()
 │   │                             CHANGED: crystallization_supervision_loss() now returns 3-tuple
 │   ├── prediction.py          ✅ PredictionNet, PrecisionNet
@@ -144,7 +146,7 @@ tests/
 ├── test_act.py                ✅
 ├── test_prediction.py         ✅
 ├── test_columnar.py           ✅
-├── test_crystallization.py    ✅  (updated for 3-tuple supervision loss return)
+├── test_crystallization.py    ✅  (updated for 3-tuple supervision loss return + 5 new buffer perf tests)
 └── test_integration.py        ✅
 ```
 

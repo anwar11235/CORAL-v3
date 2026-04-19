@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "CORAL v3 — COrtical Reasoning via Abstraction Layers"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
+    "torch>=2.4,<2.7",
     "numpy>=1.24",
     "adam-atan2>=0.0.3",
     "pydantic>=2.0",
@@ -20,6 +20,11 @@ dependencies = [
     "coolname>=2.2",
     "argdantic>=0.5",
     "huggingface_hub>=0.20",
+]
+
+[project.optional-dependencies]
+flash-attn = [
+    "flash-attn>=2.7,<3.0",
 ]
 
 [tool.setuptools.packages.find]

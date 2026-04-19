@@ -180,10 +180,8 @@ def test_buffer_capacity_limiting():
 def test_buffer_stores_cpu_tensors():
     buf = CrystallizationBuffer(capacity=100)
     buf.add(torch.randn(BATCH, PROJ_DIM * 2), torch.randn(BATCH, HIDDEN))
-    for k in buf.keys:
-        assert k.device.type == "cpu"
-    for v in buf.values:
-        assert v.device.type == "cpu"
+    assert buf.keys.device.type == "cpu"
+    assert buf.values.device.type == "cpu"
 
 
 def test_buffer_clear():
@@ -217,6 +215,107 @@ def test_buffer_consolidate_updates_codebook():
     # At least some codebook entries should have changed
     changed = (rnet.codebook.data != codebook_before).any(dim=-1)
     assert changed.any(), "Expected some codebook entries to be updated"
+
+
+def test_buffer_fill_progression():
+    """len(buffer) climbs to capacity then stays there; never exceeds capacity."""
+    capacity = 10000
+    batch_size = 384
+    buf = CrystallizationBuffer(capacity=capacity)
+    for step in range(100):
+        buf.add(torch.randn(batch_size, PROJ_DIM * 2), torch.randn(batch_size, HIDDEN))
+        expected = min((step + 1) * batch_size, capacity)
+        assert len(buf) == expected, f"step {step}: expected {expected}, got {len(buf)}"
+    assert len(buf) == capacity
+
+
+def test_buffer_ring_semantics():
+    """After saturation, new items overwrite old ones and pointer advances correctly."""
+    capacity = 10
+    buf = CrystallizationBuffer(capacity=capacity)
+    key_dim = PROJ_DIM * 2
+
+    # Fill to saturation
+    fill_keys = torch.arange(capacity * key_dim, dtype=torch.float32).reshape(capacity, key_dim)
+    buf.add(fill_keys[:4], torch.zeros(4, HIDDEN))
+    buf.add(fill_keys[4:8], torch.zeros(4, HIDDEN))
+    buf.add(fill_keys[8:], torch.zeros(2, HIDDEN))
+    assert len(buf) == capacity
+
+    # Add K=3 new items — they should overwrite slots 0,1,2
+    new_keys = torch.full((3, key_dim), 999.0)
+    buf.add(new_keys, torch.zeros(3, HIDDEN))
+    assert len(buf) == capacity  # still capped
+
+    # Slots 0,1,2 should now hold the new values
+    torch.testing.assert_close(buf.keys[:3], new_keys)
+    # Slots 3..9 should still hold the old values
+    torch.testing.assert_close(buf.keys[3:], fill_keys[3:])
+
+
+def test_buffer_consolidate_after_wrap():
+    """consolidate() works correctly after the ring buffer has wrapped around."""
+    rnet = RecognitionNetwork(HIDDEN, HIDDEN, codebook_size=8, proj_dim=PROJ_DIM)
+    capacity = 200
+    buf = CrystallizationBuffer(capacity=capacity)
+
+    # Overfill to force wraparound (300 items into capacity 200)
+    for _ in range(75):
+        buf.add(torch.randn(4, PROJ_DIM * 2), torch.randn(4, HIDDEN))
+
+    assert len(buf) == capacity
+    # consolidate should complete without error and return a utilisation fraction
+    util = buf.consolidate(rnet, num_iterations=5, device="cpu")
+    assert util is not None
+    assert 0.0 <= util <= 1.0
+
+
+def test_buffer_single_large_add():
+    """Adding a batch larger than capacity retains only the last capacity rows."""
+    capacity = 10000
+    buf = CrystallizationBuffer(capacity=capacity)
+    B = 15000
+    keys = torch.arange(B * PROJ_DIM * 2, dtype=torch.float32).reshape(B, PROJ_DIM * 2)
+    values = torch.zeros(B, HIDDEN)
+    buf.add(keys, values)
+
+    assert len(buf) == capacity
+    # Implementation clips to last capacity rows (keys[5000:15000]) starting at pointer=0,
+    # so after the write pointer wraps back to 0.
+    assert buf.pointer == 0
+    torch.testing.assert_close(buf.keys, keys[B - capacity :])
+
+
+@CUDA_ONLY
+def test_buffer_add_throughput():
+    """Verify add() throughput does not degrade after buffer saturation."""
+    import time
+    buffer = CrystallizationBuffer(capacity=10000)
+    keys = torch.randn(384, 256, device="cuda")
+    values = torch.randn(384, 512, device="cuda")
+
+    # Warmup (pre-saturation)
+    for _ in range(5):
+        buffer.add(keys, values)
+    torch.cuda.synchronize()
+
+    start_empty = time.perf_counter()
+    for _ in range(50):
+        buffer.add(keys, values)
+    torch.cuda.synchronize()
+    t_empty = (time.perf_counter() - start_empty) / 50
+
+    # Buffer is now saturated; measure post-saturation throughput
+    start_full = time.perf_counter()
+    for _ in range(50):
+        buffer.add(keys, values)
+    torch.cuda.synchronize()
+    t_full = (time.perf_counter() - start_full) / 50
+
+    assert t_full < t_empty * 1.5, (
+        f"Buffer add() degrades after saturation: "
+        f"pre={t_empty * 1000:.2f}ms, post={t_full * 1000:.2f}ms, ratio={t_full / t_empty:.2f}×"
+    )
 
 
 # ---------------------------------------------------------------------------

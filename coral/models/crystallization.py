@@ -154,37 +154,60 @@ class CrystallizationBuffer:
     experiences (converged states encountered during training) are replayed to
     update long-term cortical representations (the codebook).
 
+    Uses pre-allocated CPU tensors with vectorised slice assignment so add() runs
+    in O(B) without a Python loop per element, preventing throughput degradation
+    after buffer saturation.
+
     Args:
         capacity: Maximum number of (key, value) pairs to store.
     """
 
     def __init__(self, capacity: int = 10000) -> None:
         self.capacity = capacity
-        self.keys: list = []    # list of [proj_dim*2] CPU tensors
-        self.values: list = []  # list of [l_dim] CPU tensors
+        # Lazily allocated on first add() — we need key_dim and value_dim from inputs.
+        self.keys: Optional[torch.Tensor] = None    # [capacity, key_dim]  on CPU
+        self.values: Optional[torch.Tensor] = None  # [capacity, value_dim] on CPU
         self.pointer: int = 0
+        self.size: int = 0  # number of valid entries written, capped at capacity
+
+    def _lazy_init(self, key_dim: int, value_dim: int) -> None:
+        if self.keys is None:
+            self.keys = torch.zeros(self.capacity, key_dim, dtype=torch.float32)
+            self.values = torch.zeros(self.capacity, value_dim, dtype=torch.float32)
 
     def add(self, keys: torch.Tensor, values: torch.Tensor) -> None:
-        """Add a batch of (key, value) pairs to the buffer.
+        """Add a batch of (key, value) pairs via vectorised slice assignment.
+
+        Single GPU→CPU transfer per call; no Python loop over batch elements.
 
         Args:
-            keys:   [B, proj_dim*2] — recognition keys (may be on any device).
-            values: [B, l_dim]      — pooled converged L-states (mean over seq dim).
+            keys:   [B, key_dim]   — recognition keys (may be on any device).
+            values: [B, value_dim] — pooled converged L-states (mean over seq dim).
         """
-        keys_cpu = keys.detach().cpu()
-        values_cpu = values.detach().cpu()
+        keys_cpu = keys.detach().to(dtype=torch.float32, device="cpu", non_blocking=True)
+        values_cpu = values.detach().to(dtype=torch.float32, device="cpu", non_blocking=True)
+
         B = keys_cpu.shape[0]
-        for i in range(B):
-            if len(self.keys) < self.capacity:
-                self.keys.append(keys_cpu[i])
-                self.values.append(values_cpu[i])
-            else:
-                self.keys[self.pointer] = keys_cpu[i]
-                self.values[self.pointer] = values_cpu[i]
-            self.pointer = (self.pointer + 1) % self.capacity
+        self._lazy_init(keys_cpu.shape[1], values_cpu.shape[1])
+
+        # When B exceeds capacity, only the last capacity entries will be retained.
+        # Clip to avoid repeated indices in the assignment below (undefined behavior).
+        if B > self.capacity:
+            keys_cpu = keys_cpu[-self.capacity :]
+            values_cpu = values_cpu[-self.capacity :]
+            B = self.capacity
+
+        # Ring-buffer destination indices: [pointer, pointer+1, ..., pointer+B-1] % capacity
+        indices = (torch.arange(B, dtype=torch.long) + self.pointer) % self.capacity
+
+        self.keys[indices] = keys_cpu
+        self.values[indices] = values_cpu
+
+        self.pointer = int((self.pointer + B) % self.capacity)
+        self.size = min(self.size + B, self.capacity)
 
     def __len__(self) -> int:
-        return len(self.keys)
+        return self.size
 
     def consolidate(
         self,
@@ -209,14 +232,14 @@ class CrystallizationBuffer:
             Fraction of codebook entries that received at least one assignment
             in the final iteration, or None if the buffer was too small.
         """
-        if is_first_consolidation and len(self.keys) < int(0.8 * self.capacity):
+        if is_first_consolidation and self.size < int(0.8 * self.capacity):
             return None
 
-        if len(self.keys) < 100:
+        if self.size < 100:
             return None
 
-        all_keys = torch.stack(self.keys).to(device)      # [N, proj_dim*2]
-        all_values = torch.stack(self.values).to(device)  # [N, l_dim]
+        all_keys = self.keys[: self.size].to(device)      # [N, key_dim]
+        all_values = self.values[: self.size].to(device)  # [N, value_dim]
 
         K = recognition_net.codebook.shape[0]
         ema_weight = 1.0 if is_first_consolidation else 0.1
@@ -255,10 +278,9 @@ class CrystallizationBuffer:
         return None
 
     def clear(self) -> None:
-        """Empty the buffer (call after consolidation)."""
-        self.keys.clear()
-        self.values.clear()
+        """Reset the buffer (call after consolidation). Keeps tensors allocated for reuse."""
         self.pointer = 0
+        self.size = 0
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,22 @@
 # Core
-torch>=2.0
+torch>=2.4,<2.7
 numpy>=1.24
 
-# Attention kernel (CUDA only — install separately on GPU machines)
-# pip install flash-attn>=2.0 --no-build-isolation
-# For Hopper GPUs (H100): pip install flash-attn-interface
+# Attention kernel (OPTIONAL — A100/H100 performance optimisation)
+# The coral.models.layers._get_flash_attn_func() function falls back to
+# PyTorch's scaled_dot_product_attention if flash-attn is not installed,
+# which on A100 dispatches to FlashAttention-2 internally via cuDNN. The
+# fallback costs ~5-10% end-to-end throughput vs a standalone flash-attn install.
+#
+# To install flash-attn (requires a CUDA-capable build environment):
+#     FLASH_ATTN_CUDA_ARCHS=80 pip install flash-attn --no-build-isolation
+#
+# For A100 only, FLASH_ATTN_CUDA_ARCHS=80 reduces build time ~4× by skipping
+# sm_90/sm_100/sm_120 kernel compilation. With the torch 2.4-2.6 pin above,
+# prebuilt wheels exist and source build may not be needed at all.
 
 # Optimizer
-adam-atan2>=0.1
+adam-atan2>=0.0.3
 
 # Config / CLI
 pydantic>=2.0
