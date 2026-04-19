@@ -126,7 +126,11 @@ coral/
 │   │                             NEW: forwards crystal diagnostic tensors to outputs dict
 │   └── scheduler.py           ✅ cosine_schedule_with_warmup_lr_lambda
 └── data/
-    └── puzzle_dataset.py      ✅ PuzzleDataset, PuzzleDatasetMetadata, create_dataloader
+    ├── puzzle_dataset.py      ✅ PuzzleDataset, PuzzleDatasetMetadata, create_dataloader
+    ├── common.py              ✅ PuzzleDatasetMetadata, dihedral_transform (ported from HRM, Apache-2.0)
+    ├── build_sudoku_dataset.py ✅ Sudoku-Extreme dataset builder (ported from HRM, Apache-2.0)
+    │                             --coral-naming flag (default=True) for train__/test__ prefix output
+    └── README.md              ✅ Build instructions and post-build workflow
 scripts/
 └── train.py                   ✅ Hydra-based training entry point
                                   NEW: load_warmstart_checkpoint(), bootstrap-phase consolidation

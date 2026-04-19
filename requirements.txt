@@ -21,3 +21,7 @@ wandb>=0.16
 tqdm>=4.0
 einops>=0.7
 coolname>=2.2
+
+# Dataset building (Sudoku-Extreme port from HRM)
+argdantic>=0.5
+huggingface_hub>=0.20

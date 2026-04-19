@@ -30,8 +30,8 @@ Thumbs.db
 # Weights & Biases
 wandb/
 
-# Data
-data/
+# Data (top-level only; coral/data/ source files are tracked)
+/data/
 *.npy
 *.npz
 

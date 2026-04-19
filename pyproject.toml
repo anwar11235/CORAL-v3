@@ -18,6 +18,8 @@ dependencies = [
     "tqdm>=4.0",
     "einops>=0.7",
     "coolname>=2.2",
+    "argdantic>=0.5",
+    "huggingface_hub>=0.20",
 ]
 
 [tool.setuptools.packages.find]
