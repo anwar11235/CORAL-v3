@@ -492,6 +492,11 @@ def load_warmstart_checkpoint(
     modules (RecognitionNetwork, CrystallizationBuffer parameters) keep their
     random initialisation.
 
+    Handles torch.compile prefix mismatches on both sides: if either the
+    checkpoint or the current model was wrapped by torch.compile, keys are
+    normalised before load_state_dict so backbone weights match regardless
+    of compile state at save/load time.
+
     Optimizer state is NOT restored — optimizers always start fresh.  This is
     correct for cross-phase warm-starts where the parameter set has changed.
 
@@ -508,7 +513,22 @@ def load_warmstart_checkpoint(
 
     ckpt = torch.load(checkpoint_path, map_location="cpu")
 
-    # torch.compile wraps the model — access underlying module for load_state_dict
+    # Handle the case where the checkpoint is wrapped in a dict (e.g., from
+    # a trainer that saved {"model_state_dict": ..., "optimizer_state_dict": ...}).
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        ckpt = ckpt["model_state_dict"]
+
+    # Strip torch.compile "_orig_mod." prefix from checkpoint keys if present.
+    # Checkpoints saved from compiled models have this prefix; uncompiled
+    # models expect keys without it.
+    if any(k.startswith("_orig_mod.") for k in ckpt.keys()):
+        if rank == 0:
+            print("[CORAL-v3] Stripping '_orig_mod.' prefix from checkpoint keys (source was compiled)")
+        ckpt = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
+                for k, v in ckpt.items()}
+
+    # Unwrap torch.compile on the target model side as well (defensive:
+    # works whether current model is compiled or not).
     target_model = state.model
     if hasattr(target_model, "_orig_mod"):
         target_model = target_model._orig_mod  # type: ignore[attr-defined]
