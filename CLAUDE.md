@@ -99,7 +99,7 @@ numpy
 
 Wherever we are implementing analogs from HRM, rename those to reflect CORAL or coral. Do not use HRM in any naming or code.
 
-## Current State (Phases 0–3 complete; Phase 3a' bootstrap fix + perf fixes applied)
+## Current State (Phases 0–3 complete; Phase 3a' running — infra fixes from 2026-04-19 applied)
 
 ```
 coral/
@@ -112,9 +112,11 @@ coral/
 │   │                             NEW: crystal_bootstrap_steps field
 │   ├── coral_v3.py            ✅ CoralV3Inner — Phase 1/2/3 dispatcher
 │   │                             NEW: _crystal_gate_active flag, PredMetrics diagnostic fields
+│   │                             FIX: nearest_code.to(z_L.dtype) in bypass (flash-attn fp16/bf16 req)
 │   ├── crystallization.py     ✅ RecognitionNetwork, CrystallizationBuffer
 │   │                             PERF: CrystallizationBuffer rewritten with pre-allocated tensors;
 │   │                             vectorised add() eliminates Python loop (fixes ~11×/step slowdown)
+│   │                             PERF: @torch._dynamo.disable on add() (CPU-side op, no compile benefit)
 │   │                             NEW: consolidate(is_first_consolidation=), crystallization_diagnostics()
 │   │                             CHANGED: crystallization_supervision_loss() now returns 3-tuple
 │   ├── prediction.py          ✅ PredictionNet, PrecisionNet
@@ -137,6 +139,9 @@ scripts/
 └── train.py                   ✅ Hydra-based training entry point
                                   NEW: load_warmstart_checkpoint(), bootstrap-phase consolidation
                                   logic, train/crystal/* W&B metrics
+                                  FIX: torch 2.6/2.7 dynamo cache_size_limit/recompile_limit compat
+                                  PERF: torch.set_float32_matmul_precision("high") for TF32 on A100
+                                  LOG: flat eval/<metric> aliases for W&B cross-run overlay
 configs/
 ├── base.yaml                  ✅ Default hyperparameters
 └── phase3a_crystal_warmstart.yaml  ✅ PC + crystal warm-start config for validation run
