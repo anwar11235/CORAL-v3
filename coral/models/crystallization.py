@@ -175,6 +175,7 @@ class CrystallizationBuffer:
             self.keys = torch.zeros(self.capacity, key_dim, dtype=torch.float32)
             self.values = torch.zeros(self.capacity, value_dim, dtype=torch.float32)
 
+    @torch._dynamo.disable
     def add(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """Add a batch of (key, value) pairs via vectorised slice assignment.
 
