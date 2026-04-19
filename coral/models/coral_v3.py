@@ -200,7 +200,8 @@ class CoralV3Inner(CoralInner):
             return False, z_H, z_L, conf_mean
 
         # Bypass: substitute z_L, then update H with the substituted value
-        z_L = nearest_code
+        # Cast to z_L's dtype — codebook is fp32; flash-attn requires fp16/bf16.
+        z_L = nearest_code.to(z_L.dtype)
         if self.config.use_predictive_coding:
             mu_L = self.prediction_net(z_H)
             epsilon = z_L - mu_L
