@@ -99,7 +99,19 @@ numpy
 
 Wherever we are implementing analogs from HRM, rename those to reflect CORAL or coral. Do not use HRM in any naming or code.
 
-## Current State (Phases 0–3 complete; Phase 3a' running — infra fixes from 2026-04-19 applied)
+## Docker Image
+
+Current production image: `anwar1919/coral-v3:2026-04-20` (also `:latest`)
+Previous stable anchor: `anwar1919/coral-v3:2026-04-19` (preserved, do not delete)
+Digest: `sha256:46f7946dfbe75a600fb2ab95206f699609d4ec1d091078e3da5366d94f5236f6`
+
+Baked-in fixes (as of 2026-04-20 rebuild):
+- flash-attn pinned to 2.7.4.post1 (ABI-compatible with torch 2.6; 2.8.x crashes)
+- /workspace created + WORKDIR (all handoff docs assume /workspace)
+- pytest pre-installed
+- adam-atan2-pytorch==0.3.2 installed (fused CUDA path; avoids pure-PyTorch fallback)
+
+## Current State (Phases 0–3 complete; Phase 3a' complete — jovial-avocet 63.48%)
 
 ```
 coral/
@@ -165,12 +177,21 @@ tests/
 | **orchid-heron** | **jrtvvvi7** | **Baseline (fused AdamATan2)** | **54.2%** | **Complete ✓** |
 | agate-cuckoo | v7cmw24l | Phase 2 (routing only, λ_bal=0.01) | 7.3% at 10K | Killed — collapsed |
 | curly-manatee | — | Phase 2 (routing only, λ_bal=0.1) | 14.69% at 15K | Killed — collapsed |
+| **jovial-avocet** | **hb4bi1fu** | **Phase 3a' (PC + crystal warm-start)** | **63.48%** | **Complete ✓** |
 
-### Phase 3a' — Next Validation Run
+### Phase 3a' — Completed (jovial-avocet, 2026-04-19)
 
-Config: `configs/phase3a_crystal_warmstart.yaml`
-Warm-start from: `phase1_best_checkpoint_61pct.pt` (poetic-giraffe, 61.07%)
-Bootstrap steps: 5000 (buffer fills, no gate BCE), then first consolidation with full codebook replace.
-Success criteria: exact_accuracy ≥ 0.58, bypass_rate ≥ 0.20, codebook_utilisation ≥ 0.30.
+Key findings:
+- bypass_rate peaked at ~0.0012 (step 26040) then self-disabled — gate correctly learned single pooled codebook is too lossy
+- codebook_utilisation: 6/256 = 2.34% reproducibly — L-state manifold has ~6 natural modes
+- +2.4pp over poetic-giraffe (61.07% → 63.48%) — attribution unresolved (warm-start vs. crystal aux loss)
+- Control run (`control-no-crystal` branch) in progress to disambiguate
+
+### Phase 3b — Architecture Design Complete (2026-04-19)
+
+Architecture spec: `docs/CORAL_v3_Phase3b_MoE_Codebook_Spec.md` (branch: `moe-codebook-design`)
+Design: Soft MoE Spatial Codebook — K=8 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, reconstruction loss replaces BCE.
+Status: Review gate — awaiting researcher approval before implementation.
+Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization ≥ 5/8, no eval checkpoint below 0.60.
 
 See `PHASE3A_CHANGES.md` for launch commands and metric tracking guide.
