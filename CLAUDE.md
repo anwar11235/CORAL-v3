@@ -185,7 +185,7 @@ Key findings:
 - bypass_rate peaked at ~0.0012 (step 26040) then self-disabled — gate correctly learned single pooled codebook is too lossy
 - codebook_utilisation: 6/256 = 2.34% reproducibly — L-state manifold has ~6 natural modes
 - +2.4pp over poetic-giraffe (61.07% → 63.48%) — attribution unresolved (warm-start vs. crystal aux loss)
-- Control run (`control-no-crystal` branch) in progress to disambiguate
+- Control run config ready (`configs/phase3a_control_warmstart.yaml` on `control-no-crystal`, commit `03d32b3`) — awaiting Vast launch to disambiguate
 
 ### Phase 3b — Architecture Design Complete (2026-04-19)
 
