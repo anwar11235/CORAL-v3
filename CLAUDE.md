@@ -109,29 +109,28 @@ coral/
 │   ├── transformer_block.py   ✅ TransformerBlock (Post-Norm), TransformerBlockConfig
 │   ├── reasoning_module.py    ✅ ReasoningModule
 │   ├── coral_base.py          ✅ CoralInner, CoralConfig, InnerCarry
-│   │                             Phase 3b: moe_num_modes, lambda_moe_recon, lambda_moe_balance added
-│   │                             Phase 3a crystal_confidence_threshold/lambda_crystal marked DEPRECATED
-│   ├── coral_v3.py            ✅ CoralV3Inner — Phase 1/2/3 dispatcher
-│   │                             NEW: _crystal_gate_active flag, PredMetrics diagnostic fields
-│   │                             FIX: nearest_code.to(z_L.dtype) in bypass (flash-attn fp16/bf16 req)
-│   ├── crystallization.py     ✅ RecognitionNetwork (DEPRECATED), CrystallizationBuffer
-│   │                             Phase 3b Session 1: SpatialMoECodebook class added
-│   │                             Phase 3b Session 1: CrystallizationBuffer.add() extended with z_L_spatial
-│   │                             Phase 3b Session 1: CrystallizationBuffer.consolidate_spatial() added
+│   │                             Phase 3b: moe_num_modes, lambda_moe_recon, lambda_moe_balance
+│   │                             Phase 3a deprecated fields (crystal_confidence_threshold, lambda_crystal) DELETED
+│   ├── coral_v3.py            ✅ CoralV3Inner — Phase 1 + Phase 3b dispatcher (PC-only path active)
+│   │                             Phase 3b: SpatialMoECodebook integrated; soft mixing at every H-cycle
+│   │                             Phase 3b: PredMetrics updated (moe_recon_loss, moe_lb_loss, moe_passthrough_weight)
+│   │                             Phase 3b: columnar routing paths stubbed (NotImplementedError)
+│   │                             Phase 3b: consolidate_codebook() uses spatial k-means
+│   ├── crystallization.py     ✅ SpatialMoECodebook, CrystallizationBuffer
+│   │                             Phase 3b Session 1: SpatialMoECodebook (unweighted L_recon, always-active L_lb)
+│   │                             Phase 3b Session 1: CrystallizationBuffer.add() + consolidate_spatial()
+│   │                             Phase 3b Session 2: RecognitionNetwork + BCE supervision DELETED
 │   │                             PERF: CrystallizationBuffer rewritten with pre-allocated tensors;
 │   │                             vectorised add() eliminates Python loop (fixes ~11×/step slowdown)
-│   │                             PERF: @torch._dynamo.disable on add() (CPU-side op, no compile benefit)
-│   │                             NEW: consolidate(is_first_consolidation=), crystallization_diagnostics()
-│   │                             CHANGED: crystallization_supervision_loss() now returns 3-tuple
 │   ├── prediction.py          ✅ PredictionNet, PrecisionNet
 │   ├── columnar.py            ✅ ColumnarReasoningModule, ColumnarTransformerBlock
 │   └── sparse_embedding.py    ✅ CastedSparseEmbedding, CastedSparseEmbeddingSignSGD_Distributed
 ├── training/
 │   ├── losses.py              ✅ stablemax_cross_entropy, softmax_cross_entropy,
 │   │                             ACTLossHead, CoralV3LossHead
-│   │                             NEW: logs crystal_reconstruction_error, crystal_target_confidence_mean
+│   │                             Phase 3b: BCE crystal loss replaced by L_recon + L_lb; new crystal/* metrics
 │   ├── act.py                 ✅ CoralACT, CoralV3ACT
-│   │                             NEW: forwards crystal diagnostic tensors to outputs dict
+│   │                             Phase 3b: forwards moe_recon_loss, moe_lb_loss, moe_passthrough_weight
 │   └── scheduler.py           ✅ cosine_schedule_with_warmup_lr_lambda
 └── data/
     ├── puzzle_dataset.py      ✅ PuzzleDataset, PuzzleDatasetMetadata, create_dataloader
@@ -183,8 +182,9 @@ Key findings:
 
 Architecture spec: `docs/CORAL_v3_Phase3b_MoE_Codebook_Spec.md` (branch: `moe-codebook-design`)
 Design: Soft MoE Spatial Codebook — K=32 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, unweighted reconstruction loss + always-active L_lb.
-Status: Session 1 complete (Commits 1–3 landed). Session 2 next: CoralV3Inner integration, loss head update, config YAML.
-Session 1 modules: SpatialMoECodebook, CoralConfig MoE fields, CrystallizationBuffer.consolidate_spatial().
+Status: Sessions 1 + 2 complete (Commits 1–6 landed on moe-codebook-design). Ready for Phase 3b training run.
+Session 1 (Commits 1–3): SpatialMoECodebook, CoralConfig MoE fields, CrystallizationBuffer.consolidate_spatial().
+Session 2 (Commits 4–6): CoralV3Inner soft-mix integration, loss head update, config YAML, BCE-era deletions.
 Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization observational (K=32 for disambiguation), no eval checkpoint below 0.60.
 
 See `PHASE3A_CHANGES.md` for launch commands and metric tracking guide.
