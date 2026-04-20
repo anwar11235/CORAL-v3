@@ -1,16 +1,16 @@
 # CORAL v3 Phase 3b — Spatially-Structured Soft MoE Codebook Architecture Spec
 
 **Branch:** `moe-codebook-design`  
-**Date:** 2026-04-19  
+**Date:** 2026-04-19 (revised)  
 **Status:** Review gate — do not implement until approved
 
 ---
 
 ## 1. Executive Summary
 
-**Design:** Replace the single-codebook hard-bypass mechanism with a Soft MoE Codebook: K=8 mode experts whose values are full-spatial tensors `[seq_len, l_dim]`, plus one passthrough expert (the recurrence output). A small router MLP computes softmax weights over K+1 experts; the final z_L is the resulting convex combination. No binary gate. No BCE supervision. Codebook values are trainable parameters updated end-to-end via a reconstruction loss.
+**Design:** Replace the single-codebook hard-bypass mechanism with a Soft MoE Codebook: K=32 mode experts whose values are full-spatial tensors `[seq_len, l_dim]`, plus one passthrough expert (the recurrence output). A small router MLP computes softmax weights over K+1=33 experts; the final z_L is the resulting convex combination. No binary gate. No BCE supervision. Codebook values are trainable parameters updated end-to-end via an unweighted reconstruction loss that always provides gradient to codebook entries regardless of router weight.
 
-**Problem solved:** The Phase 3a gate correctly identified that tiling a single pooled vector across 81 sequence positions is too lossy to trust — so it learned to suppress itself. The root cause is not the gating mechanism but the loss of spatial structure in codebook values. This design preserves spatial structure by construction.
+**Problem solved:** The Phase 3a gate correctly identified that tiling a single pooled vector across 81 sequence positions is too lossy to trust — so it learned to suppress itself. The root cause is not the gating mechanism but the loss of spatial structure in codebook values. This design preserves spatial structure by construction. K=32 is set as an exploratory diagnostic to test whether the Phase 3a 6-code finding reflects a genuinely 6-mode manifold or a projection/init artifact.
 
 **Expected outcomes against four criteria:**
 
@@ -18,7 +18,7 @@
 |---|---|---|---|
 | `exact_accuracy` | 63.48% | ≥ 65.0% | Soft mixing + reconstruction loss ≥ Phase 3a's BCE auxiliary signal |
 | `mean_codebook_weight` (bypass analog) | ~0.0001 | ≥ 0.15 | Spatial fidelity makes codebook safe to use; no self-disable incentive |
-| `codebook_utilization` (fraction of K modes used) | 6/256 = 2.3% | ≥ 5/8 = 62.5% | K=8 matched to empirical ~6 modes; near-full coverage expected |
+| `codebook_utilization` (fraction of K modes used) | 6/256 = 2.3% | Observational — see §8 | K=32 chosen to disambiguate manifold structure, not to hit a utilization target |
 | PC stability (pred_error norm monotone ↓) | Stable throughout | Stable | Soft mixing feeds z_L_mixed into H, preserving PC error signal |
 
 ---
@@ -33,11 +33,21 @@ The BCE-supervised gate received an honest signal: reconstruction error `‖z_L_
 
 **The bypass fired at peak ~0.12% of samples and caused a measurable accuracy dip at step 26040.** This is consistent with the gate occasionally over-firing on the rare samples where the pooled approximation happened to be within tolerance — and those samples being genuinely worse for accuracy (the approximation was within MSE tolerance but not within reasoning-quality tolerance).
 
-### 2.2 6-mode collapse is informative, not pathological (Finding 2)
+### 2.2 6-mode collapse — informative but not conclusive (Finding 2)
 
-That exactly 6 out of 256 codebook entries are ever assigned across 10 consolidations at 5000-step intervals is a stable empirical finding. The most parsimonious interpretation: **the converged L-state manifold for Sudoku-Extreme, post-PC, has approximately 6 attractor basins.** The remaining 250 entries are dead because there is no data in their Voronoi cells — not because k-means failed to converge.
+That exactly 6 out of 256 codebook entries are ever assigned across 10 consolidations at 5000-step intervals is a stable empirical finding. **Three interpretations are consistent with this result:**
 
-This has a direct architectural implication: a codebook of K=256 for a 6-mode manifold wastes ~97% of its capacity on uninformed random initialization that never updates. K=8 is sufficient (covers 6 empirical modes with 2 margin entries). This has meaningful consequences for the new design: a smaller, denser codebook with full spatial entries is actually *more* expressive than a large pool of pooled scalars.
+1. **Manifold genuinely has 6 modes.** The converged L-state post-PC has ~6 attractor basins; the other 250 codes sit in empty regions of key-space because there is simply no data there.
+2. **K-means init artifact.** The other 250 codes were initialized in regions of key-space that no real data point reaches — they are *unreachable* by the cosine-similarity assignment, not absent-by-virtue-of-no-data. The 6-code result reflects the density of the projection space, not the manifold.
+3. **Undertrained projections.** `proj_h` and `proj_l` may have collapsed the key space to ~6 distinguishable regions regardless of actual manifold structure, making any assignment to >6 bins geometrically impossible.
+
+These cannot be distinguished from the Phase 3a data alone. If we set K=8 based on interpretation #1 and interpretations #2 or #3 are correct, Phase 3b would trivially reproduce the 6-code finding — having encoded the assumption into the architecture, then verified it tautologically.
+
+**Phase 3b launches with K_modes=32 to disambiguate.** Codebook utilization becomes a measured diagnostic:
+- If utilization saturates at ~6/32 (≈19%), interpretation #1 is likely correct; future runs can reduce K to 8.
+- If utilization scales to 20+/32 (>60%), the Phase 3a finding was a projection or init artifact; the manifold is richer than assumed and Phase 4 design should revisit codebook size.
+
+The cost of K=32 over K=8 is negligible (see §6). The information value of the disambiguation is high.
 
 ### 2.3 Attribution of +2.4pp is unresolved (Finding 3)
 
@@ -55,7 +65,7 @@ If the control run shows Hypothesis A is sufficient, the reconstruction loss wei
 
 ## 3. Proposed Architecture
 
-**Decision:** Variant D (Soft MoE over codebook experts), with modifications to address the spatial structure problem. Specifically: codebook values are full spatial tensors `[seq_len, l_dim]`, not pooled vectors; one passthrough expert is included; BCE supervision is removed.
+**Decision:** Variant D (Soft MoE over codebook experts), with modifications to address the spatial structure problem. Specifically: codebook values are full spatial tensors `[seq_len, l_dim]`, not pooled vectors; one passthrough expert is included; BCE supervision is removed; reconstruction loss is unweighted (always active regardless of router weights — see §3.1).
 
 **Rationale over other variants:**
 - Variant A (per-head channel-split): splits channels, still tiles each head's code across positions. Does not fix root cause.
@@ -67,16 +77,16 @@ If the control run shows Hypothesis A is sufficient, the reconstruction loss wei
 
 **Symbols:**
 - B: batch size; S: seq_len; D: l_dim = h_dim = 512; P: proj_dim = 128; key_dim = 2P = 256
-- K_modes = 8; K = K_modes + 1 = 9 (8 codebook experts + 1 passthrough expert)
+- K_modes = 32; K = K_modes + 1 = 33 (32 codebook experts + 1 passthrough expert)
 
 **Learnable parameters (new components):**
 
 ```
-codebook_values:  R^{K_modes × S × D}      # spatial mode templates
-codebook_keys:    R^{K_modes × key_dim}     # matching keys (kept for diagnostics / optional consolidation)
+codebook_values:  R^{K_modes × S × D}      # spatial mode templates [32, 81, 512]
+codebook_keys:    R^{K_modes × key_dim}     # matching keys (kept for consolidation init)
 proj_h:           R^{D × P}                 # unchanged from Phase 3a
 proj_l:           R^{D × P}                 # unchanged from Phase 3a
-router_mlp:       MLP(key_dim → 64 → K)     # replaces confidence_head
+router_mlp:       MLP(key_dim → 64 → K)     # replaces confidence_head; K=33
 ```
 
 **Step 1 — Recognition key** (unchanged):
@@ -88,10 +98,10 @@ key    = cat([h_pool, l_pool], dim=-1)   # [B, key_dim]
 
 **Step 2 — Routing weights:**
 ```
-logits = router_mlp(key)                 # [B, K]
+logits = router_mlp(key)                 # [B, K]   K=33
 w      = softmax(logits, dim=-1)         # [B, K], sums to 1
-w_cb   = w[:, :K_modes]                 # [B, K_modes] codebook weights
-w_pt   = w[:, K_modes]                  # [B]          passthrough weight
+w_cb   = w[:, :K_modes]                 # [B, K_modes=32] codebook weights
+w_pt   = w[:, K_modes]                  # [B]              passthrough weight
 ```
 
 **Step 3 — L-module recurrence** (ALWAYS runs, same as current):
@@ -106,34 +116,42 @@ z_bypass = einsum('bk,ksd->bsd', w_cb, codebook_values)  # [B, S, D]
 
 **Step 5 — Soft blend:**
 ```
-z_L_out = w_pt.unsqueeze(-1).unsqueeze(-1) * z_L_rec
-        + (1 - w_pt).unsqueeze(-1).unsqueeze(-1) * z_bypass
-        = w_pt[:, None, None] * z_L_rec + (1 - w_pt[:, None, None]) * z_bypass
+z_L_out = w_pt[:, None, None] * z_L_rec + (1 - w_pt[:, None, None]) * z_bypass
 ```
 
-**Training loss — reconstruction:**
+**Training loss — reconstruction (unweighted):**
 ```
-# At 1-step-grad step, z_L_final = z_L_out (with gradient to codebook_values via z_bypass)
-# Reconstruction target: what would z_bypass need to look like to match converged z_L?
-# We want codebook to track converged states; gradient flows to codebook_values.
-# Stop-gradient on z_L_final to prevent encoder collapse (codebook chases current z_L, not vice versa).
+L_recon = mean_batch(||sg(z_L_final) - z_bypass||^2)   # mean over [B, S, D]
+```
 
-L_recon = mean(w_codebook_sum * ||sg(z_L_final) - z_bypass||^2)
-```
-where `w_codebook_sum = 1 - w_pt` = fraction of output from codebook. This weights the reconstruction loss by how much the model is using the codebook; when w_pt → 1, codebook gets no gradient from reconstruction (consistent — it's not being used).
+The `w_codebook_sum` multiplier from the original draft is **removed**. `z_bypass` always receives reconstruction gradient regardless of the current router weights. This is the anti-passthrough-dominance mechanism (see below for justification). `sg()` denotes stop-gradient: the codebook learns to match the converged recurrence output, not the other way around.
 
 **Training loss — load balancing (codebook entries only):**
 ```
 w_cb_mean = mean_batch(w_cb)            # [K_modes], mean routing weight per mode
 target    = uniform(K_modes) = 1/K_modes
-L_lb      = KL(w_cb_mean || target) * sg(1 - mean_batch(w_pt))
+L_lb      = KL(w_cb_mean || target)
 ```
-The `sg(1 - mean_batch(w_pt))` multiplier suppresses the load-balancing loss when the model is primarily using the passthrough expert — we don't want to force codebook diversity when the codebook isn't contributing.
+
+The `sg(1 - mean_batch(w_pt))` suppressor from the original draft is **removed**. Load-balancing pressure on codebook routing is always active, regardless of passthrough weight.
 
 **Total loss addition:**
 ```
 L_crystal = lambda_moe_recon * L_recon + lambda_moe_balance * L_lb
 ```
+
+**Anti-passthrough-dominance mechanism — why Option B, why not A/C/D:**
+
+The original draft weighted `L_recon` by `(1 - w_pt)` and suppressed `L_lb` by `sg(1 - mean_batch(w_pt))`. Both multipliers vanish when `w_pt → 1`, making `w_pt = 1.0` a gradient-free stable equilibrium — the Phase 3a self-disable failure reproduced in a new form.
+
+**Option B (unweighted reconstruction) was chosen** over the alternatives:
+- **Option A (direct passthrough penalty `relu(mean(w_pt) - w_pt_max)²`):** Adds a hyperparameter `w_pt_max` and creates only a penalized, not structurally-prevented equilibrium. A sufficiently large task-loss benefit from passthrough dominance can still overcome a fixed penalty.
+- **Option C (softmax clamp, `w_pt ≤ w_pt_max` architecturally):** Restricts router expressiveness — the model can never fully defer to recurrence even on novel puzzles where the codebook is genuinely unhelpful. Wrong inductive bias.
+- **Option D (schedule `w_pt_max` from 0.5 → 1.0 over 10k steps):** Introduces a training schedule hyperparameter with a specific time constant; fragile to different training dynamics.
+
+With Option B: `codebook_values` always receive gradient from `L_recon`, so by the time the router might discover passthrough dominance is viable, the codebook is already tracking real mode locations. A well-trained codebook reduces `L_recon`, incentivizing the router to use it (lower task loss via more accurate `z_L_out`). The combined removal of the `L_lb` suppressor means the router also receives constant pressure toward balanced codebook usage. These two changes together make `w_pt = 1.0` unstable, not just penalized.
+
+The "heavy-handed" concern about Option B (codebook trains even when not used) is actually a feature: the codebook needs to be ready *before* the router starts using it. Weighting gradient by usage creates a chicken-and-egg problem.
 
 ### 3.2 Tensor shapes at each step
 
@@ -142,20 +160,20 @@ L_crystal = lambda_moe_recon * L_recon + lambda_moe_balance * L_lb
 | Input | z_H | [B, S, D] |
 | Input | z_L (carry) | [B, S, D] |
 | Recognition key | key | [B, 256] |
-| Routing | logits | [B, 9] |
-| Routing | w | [B, 9] |
-| Codebook weights | w_cb | [B, 8] |
+| Routing | logits | [B, 33] |
+| Routing | w | [B, 33] |
+| Codebook weights | w_cb | [B, 32] |
 | Passthrough weight | w_pt | [B] |
 | Recurrence output | z_L_rec | [B, S, D] |
-| Codebook values | codebook_values | [8, 81, 512] |
+| Codebook values | codebook_values | [32, 81, 512] |
 | Codebook mixture | z_bypass | [B, S, D] |
 | Final L state | z_L_out | [B, S, D] |
 
 ### 3.3 Answers to open design questions
 
-**1. Partition scheme:** Full-input, no partition. Each of K_modes expert codebooks covers the full `[S, D]` spatial state. Channel-split or position-split would not fix the core problem; they merely re-tile smaller vectors. Orthogonal codebooks are enforced through k-means initialization (modes start at the 6 empirical cluster centroids extended by 2 random init entries), not through an architectural constraint.
+**1. Partition scheme:** Full-input, no partition. Each of K_modes expert codebooks covers the full `[S, D]` spatial state. Channel-split or position-split would not fix the core problem; they merely re-tile smaller vectors. Codebooks are initialized from k-means centroids on actual z_L spatial states at step 5000 (see §3.4 and Commit 3 below); no architectural orthogonality constraint is imposed.
 
-**2. Expert structure:** Pure codebook lookup — `codebook_values[k]` is a learned `[S, D]` parameter, no per-expert network. A per-expert network (e.g., small MLP per mode) would add parameters proportional to `K_modes × network_size` and introduce dead-expert risk from more complex gradient dynamics. The empirical ~6-mode structure does not require nonlinear expert computation; a learned template per mode is sufficient.
+**2. Expert structure:** Pure codebook lookup — `codebook_values[k]` is a learned `[S, D]` parameter, no per-expert network. A per-expert network (e.g., small MLP per mode) would add parameters proportional to `K_modes × network_size` and introduce dead-expert risk from more complex gradient dynamics. A learned template per mode is sufficient.
 
 **3. Routing input:** Joint z_H + z_L (mean-pooled, projected). z_H carries the high-level reasoning context that identifies which problem regime we're in (mode selector); z_L carries the current low-level state that helps identify which attractor we're approaching. Using z_H alone would lose information about where in z_L-space we are; using z_L alone would lose the high-level context.
 
@@ -165,12 +183,13 @@ L_crystal = lambda_moe_recon * L_recon + lambda_moe_balance * L_lb
 
 ### 3.4 Consolidation in the new design
 
-Offline k-means consolidation is retained as an **initialization mechanism only** (first 5000 bootstrap steps), not as the primary update path. During consolidation:
-- The existing `CrystallizationBuffer` can still collect `(key, pooled_z_L)` pairs during bootstrap
-- First consolidation replaces `codebook_keys` with k-means centroids (K=8, not 256)
-- `codebook_values` are initialized from the nearest pooled z_L per mode, then expanded to `[S, D]` via the current segment's per-position means (separate per-position buffer needed; see Implementation Plan)
+Offline k-means consolidation is retained as an **initialization mechanism only** (first 5000 bootstrap steps), not as the primary update path. The `CrystallizationBuffer` must store full per-position z_L (shape `[B, S, D]`) during bootstrap — not just pooled means — so that the first consolidation can initialize `codebook_values` to real spatial cluster centroids (see Commit 3 in §7).
 
-After first consolidation, backprop is the sole update mechanism for `codebook_values`. EMA is removed; the standard optimizer handles codebook parameter updates. The `CrystallizationBuffer` can be disabled after the first consolidation to avoid the CPU-transfer overhead.
+After first consolidation at step 5000:
+- `codebook_values` are set to the K=32 k-means centroids from the spatial buffer
+- Backprop is the sole update mechanism for `codebook_values` going forward
+- EMA is removed; the standard optimizer handles codebook parameter updates
+- `CrystallizationBuffer` is disabled to avoid ongoing CPU-transfer overhead
 
 ### 3.5 BCE supervision path
 
@@ -194,7 +213,11 @@ The `z_L_out` now carries a blend of codebook and recurrence information. When w
 
 **No change needed** to PC supervision loss — `epsilon_final`, `pi_final` from the 1-step-grad step flow through `z_L_out`, which includes gradients from both the router and the recurrence path.
 
-**One subtlety:** the PC prediction target `mu_L = prediction_net(z_H)` is trained to predict the recurrence output, not the codebook output. When codebook usage is high, `mu_L` is predicting a mixture of codebook and recurrence — which is a slightly different target than before. This should be self-consistent as both `prediction_net` and `codebook_values` will adapt, but could cause a short adaptation transient at the start of Phase 3b training. Monitor `pred_error_norm` for the first 5000 steps; it may temporarily increase.
+**One subtlety:** the PC prediction target `mu_L = prediction_net(z_H)` is trained to predict the recurrence output, not the codebook output. When codebook usage is high, `mu_L` is predicting a mixture of codebook and recurrence — a shifted target. The "self-consistency" claim (both `prediction_net` and `codebook_values` will adapt) holds in theory but admits multiple stable equilibria, and training dynamics choose between them stochastically.
+
+**Diagnostic: `pred_error_stratified_by_w_pt`.** At every eval, partition the batch into high-passthrough samples (w_pt > 0.9) and high-codebook samples (w_pt < 0.5) and log `pred_error_norm` separately for each group. If the two groups show diverging `pred_error_norm` trajectories — specifically, if high-codebook samples have consistently higher error than high-passthrough samples after step 20K — `prediction_net` is not adapting to cover the codebook regime. This would indicate a degenerate equilibrium where PC optimizes for recurrence-path inputs only. If detected, reduce `lambda_moe_recon` to push `mean_codebook_weight` lower until PC stability is restored.
+
+Monitor `pred_error_norm` overall for the first 5000 steps post-bootstrap (steps 5K–10K); it may temporarily increase as the router activates and shifts the target distribution.
 
 ### 4.2 Interaction with ACT
 
@@ -225,37 +248,39 @@ One concern: if the codebook provides a very accurate z_L_out early in an ACT se
 
 **Description:** All routing weight concentrates on 1-2 codebook experts, with the remaining K_modes-2 dead. Diagnostic: `entropy(w_cb) < log(2)` (below 1-bit).
 
-**Why this is likely:** Sudoku-Extreme has ~6 natural modes but not all modes appear equally often. Early in training, a few modes dominate the distribution; without encouragement, the router may collapse to those.
+**Why this is likely:** Sudoku-Extreme may have only ~6 natural modes (per the Phase 3a finding). With K=32, a near-optimal router might legitimately concentrate weight on 6 entries and ignore 26 — which is not "collapse" in the pathological sense but expected behavior. The `L_lb` load-balancing loss will resist this; the tradeoff between L_lb pressure and natural mode structure is controlled by `lambda_moe_balance`.
 
-**Mitigation:** Load-balancing loss `L_lb` penalizes non-uniform routing over codebook entries. Start with `lambda_moe_balance = 0.01`; if entropy stays below log(3) at step 10K, increase to 0.05.
+**Mitigation:** Start with `lambda_moe_balance = 0.01`; if entropy stays below log(6) at step 10K (fewer than 6 modes meaningfully active), increase to 0.05. If codebook_utilization measurement reveals a genuinely 6-mode manifold (see §2.2 disambiguation), it is acceptable to reduce K to 8 in a follow-up run and relax L_lb.
 
-**Diagnostic metric:** `crystal/routing_entropy` = `mean_batch(entropy(w_cb))`, logged at each eval. Alert if below `log(K_modes / 2) = log(4)` after step 10K.
+**Diagnostic metric:** `crystal/routing_entropy` = `mean_batch(entropy(w_cb))`, logged at each eval. Alert if below `log(4)` after step 10K.
 
 ### 5.2 Passthrough dominance
 
 **Description:** `mean(w_pt) → 1.0`; the model permanently delegates to recurrence and the codebook is never used. This is a valid local minimum (accuracy may be fine) but defeats the purpose.
 
-**Why this happens:** If `L_recon` is large early (codebook is random), the router can minimize loss by routing all weight to passthrough. The reconstruction loss has no effect when w_codebook_sum → 0.
+**Why the original design allowed this:** The original `L_recon` weighted by `(1 - w_pt)` and the `L_lb` suppressed by `sg(1 - mean_batch(w_pt))` both vanished when `w_pt → 1.0`. This made passthrough dominance a gradient-free stable equilibrium.
 
-**Mitigation:** Bootstrap phase (first 5000 steps) masks the router gradient and initializes all routing logits to 0 (equal weights = 1/K per expert). After bootstrap, codebook values have been initialized via consolidation and L_recon is meaningful. Additionally, the initialization of `router_mlp` output to near-zero (bias=0, weights small) ensures early routing is approximately uniform.
+**Mitigation (structural, not just monitoring):** Both multipliers are removed. `L_recon` is now unweighted — `codebook_values` always receive reconstruction gradient regardless of router weight (Option B). `L_lb` is always active. The resulting gradient landscape makes `w_pt = 1.0` unstable: `codebook_values` continuously learn real mode locations from `L_recon`, and `L_lb` continually pushes routing weight toward the now-accurate codebook entries. Passthrough dominance can no longer be a stable equilibrium when `lambda_moe_balance > 0` and `lambda_moe_recon > 0`.
 
-**Diagnostic metric:** `crystal/mean_passthrough_weight` = `mean_batch(w_pt)`. If this exceeds 0.90 beyond step 20K with `lambda_moe_balance > 0`, investigate.
+**Remaining risk:** If `codebook_values` are poorly initialized (random noise at step 5000), the router's first gradient signals on `L_recon` may still incentivize passthrough before the codebook warms up. This is why Commit 3 (spatial consolidation — mandatory, see §7) is in the minimum viable set: the codebook must be initialized from real z_L cluster centroids before the router activates, not random noise.
+
+**Diagnostic metric:** `crystal/mean_passthrough_weight` = `mean_batch(w_pt)`. Monitor trajectory; a healthy run should show `mean_passthrough_weight` declining from ~1.0 at step 5K to ≤0.85 by step 15K. If still above 0.90 at step 20K despite `lambda_moe_balance > 0`, the codebook initialization at step 5K was likely inadequate — inspect consolidation logs and verify Commit 3 ran correctly.
 
 ### 5.3 Codebook reconstruction failure
 
 **Description:** `L_recon` stays high despite training — codebook_values fail to converge to the mode centroids.
 
-**Why this might happen:** If K=8 is too few and the empirical manifold has more than 8 modes, or if the modes are non-stationary during training (z_L distribution shifts as PC improves), reconstruction error stays elevated.
+**Why this might happen:** If K=32 and the empirical manifold actually has >32 modes (unlikely but possible), or if the modes are non-stationary during training (z_L distribution shifts as PC improves), reconstruction error stays elevated.
 
-**Mitigation:** (a) K=8 chosen with 2× empirical-mode headroom; should be adequate. (b) Codebook initialization from consolidation at step 5000 gives a warm start on actual mode locations. (c) The EMA consolidation path can be re-enabled as a slow background update if backprop-only proves insufficient — this is a lever we can pull mid-training.
+**Mitigation:** (a) K=32 is well above the 6 empirically observed modes from Phase 3a; should be adequate for most scenarios. (b) Spatial codebook initialization from consolidation at step 5000 gives a real warm start (unlike Phase 3a's random init). (c) The EMA consolidation path can be re-enabled as a slow background update if backprop-only proves insufficient — this is a lever we can pull mid-training.
 
-**Diagnostic metric:** `crystal/reconstruction_error` = `mean_batch(‖sg(z_L_final) - z_bypass‖²)`. Target: drops below 0.5 by step 15K (compare to Phase 3a where reconstruction_error was logged but never drove gradient).
+**Diagnostic metric:** `crystal/reconstruction_error` = `mean_batch(‖sg(z_L_final) - z_bypass‖²)`. Target: drops below 0.5 by step 15K. If it remains above 1.0 at step 20K, investigate whether k-means initialization was effective or whether the L-state distribution has shifted significantly from the bootstrap-phase observations.
 
 ### 5.4 Bootstrapping instability from spatial codebook initialization
 
 **Description:** `codebook_values` are initialized randomly. At step 0, `z_bypass = weighted sum of noise`, which would corrupt z_L_out. Even small w_codebook contributions early could destabilize the PC error signal.
 
-**Mitigation:** During bootstrap (steps 0–5000): hard-set `w_pt = 1.0` (router output is masked; passthrough gets all weight). No gradient through router or codebook during bootstrap. After step 5000: consolidation runs, codebook_values get warm-started from actual z_L statistics, then router gradient is unmasked.
+**Mitigation:** During bootstrap (steps 0–5000): hard-set `w_pt = 1.0` (router output is masked; passthrough gets all weight). No gradient through router or codebook during bootstrap. After step 5000: consolidation runs from spatial buffer (Commit 3), `codebook_values` get warm-started from actual z_L spatial statistics, then router gradient is unmasked.
 
 This is identical in spirit to the `_crystal_gate_active` flag in Phase 3a, just with a different mechanism.
 
@@ -282,88 +307,93 @@ The only remaining asymmetry: during bootstrap, router is masked (passthrough=1.
 | Component | Phase 3a | Phase 3b | Delta |
 |---|---|---|---|
 | proj_h, proj_l | 131,072 | 131,072 | 0 |
-| codebook_values | 256 × 512 = 131,072 (pooled) | 8 × 81 × 512 = 331,776 (spatial) | +200,704 |
-| codebook_keys | 256 × 256 = 65,536 | 8 × 256 = 2,048 | −63,488 |
-| confidence_head / router_mlp | 256×64+64×1 ≈ 16,448 | 256×64+64×9 ≈ 16,960 | +512 |
-| **Total crystal module** | ~344,128 | ~481,856 | **+137,728** |
-| **% of 31M model** | 1.11% | 1.55% | **+0.44%** |
+| codebook_values | 256 × 512 = 131,072 (pooled) | 32 × 81 × 512 = 1,327,104 (spatial) | +1,196,032 |
+| codebook_keys | 256 × 256 = 65,536 | 32 × 256 = 8,192 | −57,344 |
+| confidence_head / router_mlp | 256×64+64×1 ≈ 16,448 | 256×64+64×33 ≈ 18,560 | +2,112 |
+| **Total crystal module** | ~344,128 | ~1,484,928 | **+1,140,800** |
+| **% of 31M model** | 1.11% | 4.79% | **+3.68%** |
 
-Net parameter change: +137,728 params ≈ **+0.44%** of the full model. Negligible.
+Net parameter change: +1,140,800 params ≈ **+3.68%** of the full model. Still negligible relative to model size and well within memory budget.
 
 ### FLOPs per forward pass delta
 
 The dominant additions per batch step:
-1. `einsum('bk,ksd->bsd', w_cb, codebook_values)`: B × K_modes × S × D = 32 × 8 × 81 × 512 ≈ **10.7M FLOPs**
-2. Router MLP (256→64→9): B × (256×64 + 64×9) ≈ 32 × **16,960 FLOPs** ≈ 0.54M FLOPs
+1. `einsum('bk,ksd->bsd', w_cb, codebook_values)`: B × K_modes × S × D = 32 × 32 × 81 × 512 ≈ **42.9M FLOPs**
+2. Router MLP (256→64→33): B × (256×64 + 64×33) ≈ 32 × **18,560 FLOPs** ≈ 0.59M FLOPs
 3. Reconstruction loss: elementwise over [B,S,D] = 32 × 81 × 512 ≈ **1.3M FLOPs**
 4. L_module recurrence: always ran in Phase 3a too (bypass was eval-only). No change.
 
-Reference full forward pass: ~8 TransformerBlocks × (attn + SwiGLU) ≈ 8 × (2BST²D + 4BSTD²) with T=81, D=512, B=32 ≈ **~6B FLOPs**. The added operations above total ~12.5M FLOPs = **+0.2%**.
+Reference full forward pass: ~8 TransformerBlocks × (attn + SwiGLU) ≈ **~6B FLOPs**. The added operations above total ~44.8M FLOPs = **+0.7%**. Still negligible.
 
 ### VRAM delta
 
-- codebook_values bf16: 8 × 81 × 512 × 2 bytes = **663 KB**
-- Optimizer states for codebook_values (AdamATan2, 2 moment tensors): ~1.3 MB fp32
-- **Total: ~2.0 MB** additional VRAM on a 40GB device. Negligible.
+- codebook_values bf16: 32 × 81 × 512 × 2 bytes = **2.65 MB**
+- Optimizer states for codebook_values (AdamATan2, 2 moment tensors): ~5.3 MB fp32
+- Spatial buffer (bootstrap, steps 0–5K): 10000 × 81 × 512 × 4 bytes ≈ **1.65 GB** on CPU (not GPU)
+- **GPU VRAM: ~8 MB additional**. Negligible on 40GB device.
 
 ### Throughput impact
 
-The einsum over codebook_values is a B × K_modes batched GEMV — 0.2% additional FLOPs, implemented as a single `torch.einsum` call that cuBLAS can handle efficiently. Expected throughput: **no measurable change from 0.14 s/it.** The CrystallizationBuffer CPU transfers are reduced (only active during bootstrap, then disabled) — Phase 3b may actually be slightly faster at steps > 5000 vs. Phase 3a's ongoing buffer adds.
+The einsum over codebook_values scales linearly with K_modes. At K=32 vs K=8 (4×), the einsum FLOPs increase from ~10.7M to ~42.9M — still only 0.7% of total FLOPs. Expected throughput: **no measurable change from 0.14 s/it.** The spatial buffer CPU transfers (only during bootstrap) add ~81×512 floats per sample per step vs. the Phase 3a pooled 512 floats — 81× larger per-sample transfer, but only during the 5000-step bootstrap window.
 
 ---
 
 ## 7. Implementation Plan
 
-Commits are estimated at ≤200 LOC each. Minimum launch-ready set: Commits 1–5. Commit 6 can follow before the training run begins; Commit 7 is optional.
+Commits are estimated at ≤200 LOC each. **Minimum launch-ready set: Commits 1–6.** Commit 3 (spatial consolidation) is mandatory and must land before Commit 4 (`CoralV3Inner` update) since the forward pass depends on proper codebook initialization.
 
-**Commit 1 — `SpatialMoECodebook` class in `crystallization.py`** *(Hard, ~180 LOC)*
-- New class: `SpatialMoECodebook(nn.Module)`
-- Parameters: `codebook_values [K_modes, seq_len, l_dim]`, `codebook_keys [K_modes, key_dim]`, `router_mlp`
-- `proj_h`, `proj_l` moved here from `RecognitionNetwork` (reused projection logic)
-- `forward(z_H, z_L)` → returns `(w [B, K+1], z_bypass [B, S, D], key [B, key_dim])`
-- `moe_losses(z_L_final, w, z_bypass)` → returns `(L_recon, L_lb)` — both scalars
-- `bootstrap_mask_router(active: bool)` — sets a flag that forces `w_pt = 1.0`
-- Keep `CrystallizationBuffer` unchanged for bootstrap consolidation; deprecate `RecognitionNetwork` and both supervision functions
-
-**Commit 2 — `CoralConfig` additions** *(Trivial, ~20 LOC)*
-- New fields: `moe_num_modes: int = 8`, `lambda_moe_recon: float = 0.1`, `lambda_moe_balance: float = 0.01`
+**Commit 1 — `CoralConfig` additions** *(Trivial, ~20 LOC)*
+- New fields: `moe_num_modes: int = 32`, `lambda_moe_recon: float = 0.1`, `lambda_moe_balance: float = 0.01`
 - Replace `crystal_confidence_threshold` with nothing (removed); remove `lambda_crystal`
 - Keep `crystal_bootstrap_steps`, `crystal_consolidation_interval`, `crystal_buffer_capacity` (used for bootstrap consolidation)
 - Keep `codebook_size` for `CrystallizationBuffer` consolidation compatibility; the new parameter is `moe_num_modes`
 
-**Commit 3 — `CoralV3Inner` update** *(Moderate, ~120 LOC)*
+**Commit 2 — `SpatialMoECodebook` class in `crystallization.py`** *(Hard, ~180 LOC)*
+- New class: `SpatialMoECodebook(nn.Module)`
+- Parameters: `codebook_values [K_modes, seq_len, l_dim]`, `codebook_keys [K_modes, key_dim]`, `router_mlp`
+- `proj_h`, `proj_l` moved here from `RecognitionNetwork` (reused projection logic)
+- `forward(z_H, z_L)` → returns `(w [B, K+1], z_bypass [B, S, D], key [B, key_dim])`
+- `moe_losses(z_L_final, w, z_bypass)` → returns `(L_recon, L_lb)` — both scalars; `L_recon` is unweighted
+- `bootstrap_mask_router(active: bool)` — sets a flag that forces `w_pt = 1.0`
+- Keep `CrystallizationBuffer` for bootstrap; deprecate `RecognitionNetwork` and both supervision functions
+
+**Commit 3 — Spatial consolidation for `CrystallizationBuffer`** *(Moderate, ~130 LOC)*
+- `CrystallizationBuffer.add()` extended to collect full per-position z_L (shape `[B, S, D]`), stored as CPU float32 alongside the existing pooled keys
+- Buffer VRAM: no GPU memory (CPU-only); CPU memory: capacity × S × D × 4 bytes = 10000 × 81 × 512 × 4 ≈ 1.65 GB CPU. Acceptable.
+- First consolidation at step 5000: runs k-means on spatial z_L (K=32 centroids), initializes `codebook_values` directly from spatial centroids
+- k-means initialization: Forgy init (K random samples from buffer as starting centroids), 100 iterations of Lloyd's algorithm on CPU using cosine similarity on keys for cluster assignment but Euclidean distance on z_L spatial values for centroid update
+- Returns utilization count (how many of K centroids are non-empty after assignment)
+- Previous pooled-value path kept for `codebook_keys` initialization (unchanged)
+- `CrystallizationBuffer.clear()` now also clears the spatial values buffer
+
+**Commit 4 — `CoralV3Inner` update** *(Moderate, ~120 LOC)*
 - Instantiate `SpatialMoECodebook` in place of `RecognitionNetwork` + `confidence_head`
 - Add `_apply_moe_mixing(z_H, z_L, z_L_rec)` → `z_L_out` helper — single call site for the soft mix
 - Remove `_maybe_crystal_bypass_nograd` (hard bypass gone)
 - Remove `is_last_h` check from crystal path — soft mix now applies at every H-cycle
 - Update `_compute_crystal_supervision_loss` → `_compute_moe_losses` — returns `(L_recon, L_lb)` instead of `(bce_loss, recon_err, tgt_conf)`
-- `_maybe_record_crystal` unchanged (still feeds `CrystallizationBuffer` during bootstrap)
+- Update `_maybe_record_crystal` to feed spatial z_L to buffer (requires new `add_spatial()` call)
 - `crystal_bypass_count` metric renamed `moe_passthrough_weight` (continuous, not integer)
 
-**Commit 4 — `CoralV3LossHead` and `PredMetrics` update** *(Trivial, ~40 LOC)*
+**Commit 5 — `CoralV3LossHead` and `PredMetrics` update** *(Trivial, ~40 LOC)*
 - Replace `crystal_supervision_loss_final` field with `moe_recon_loss`, `moe_lb_loss`
 - Loss head: `L_crystal = lambda_moe_recon × moe_recon_loss + lambda_moe_balance × moe_lb_loss`
-- Update logged W&B metrics: `crystal/recon_loss`, `crystal/lb_loss`, `crystal/mean_passthrough_weight`, `crystal/routing_entropy`, `crystal/codebook_utilization`
+- Update logged W&B metrics: `crystal/recon_loss`, `crystal/lb_loss`, `crystal/mean_passthrough_weight`, `crystal/routing_entropy`, `crystal/codebook_utilization`, `crystal/pred_error_high_pt`, `crystal/pred_error_high_cb`
 - Remove `crystal/bypass_rate` (replaced by `crystal/mean_codebook_weight = 1 - mean_passthrough_weight`)
 
-**Commit 5 — New config `configs/phase3b_moe_codebook.yaml`** *(Trivial, ~50 LOC)*
+**Commit 6 — New config `configs/phase3b_moe_codebook.yaml`** *(Trivial, ~50 LOC)*
 - Architecture: same as `phase3a_crystal_warmstart.yaml`
-- New fields: `moe_num_modes: 8`, `lambda_moe_recon: 0.1`, `lambda_moe_balance: 0.01`
-- Warm-start from `phase1_best_checkpoint_61pct.pt` (same checkpoint as Phase 3a — gives stable z_L distribution for bootstrap consolidation)
+- New fields: `moe_num_modes: 32`, `lambda_moe_recon: 0.1`, `lambda_moe_balance: 0.01`
+- Warm-start from `phase1_best_checkpoint_61pct.pt` (same checkpoint as Phase 3a)
 - Bootstrap: `crystal_bootstrap_steps: 5000` (unchanged)
 
-**Commit 6 — Update `tests/test_crystallization.py`** *(Moderate, ~100 LOC)*
+**Commit 7 — Update `tests/test_crystallization.py`** *(Moderate, ~100 LOC — can land before run but not blocking)*
 - Remove `RecognitionNetwork` tests; replace with `SpatialMoECodebook` unit tests
-- Test: `forward()` output shapes correct; `w` sums to 1; `z_bypass` shape matches `[B,S,D]`
-- Test: gradient flows to `codebook_values` from `moe_losses()`
+- Test: `forward()` output shapes correct; `w` sums to 1; `z_bypass` shape matches `[B, S, D]`
+- Test: gradient flows to `codebook_values` from `moe_losses()` regardless of router weights (verifies Option B unweighted reconstruction)
 - Test: `bootstrap_mask_router(True)` forces `w_pt ≈ 1.0`
-- Test: `moe_losses()` `L_lb` is zero when routing is uniform; non-zero when collapsed
-
-**Commit 7 — Spatial consolidation for `CrystallizationBuffer`** *(Moderate, ~80 LOC — OPTIONAL)*
-- `CrystallizationBuffer.add()` extended to also collect per-position z_L (not just pooled mean)
-- First consolidation: assigns K_modes cluster centroids using spatial z_L, writes them to `codebook_values`
-- This replaces the current "pooled centroid tiled to [S,D]" hack for initialization
-- Can be deferred to Phase 3b follow-up; without it, `codebook_values` are initialized to zero and rely on backprop from step 5000 onward (slower warm-start, but correct)
+- Test: `L_lb` is near-zero when routing is uniform; non-zero when collapsed to single expert
+- Test: spatial consolidation initializes `codebook_values` to non-random values (sanity check on Commit 3)
 
 ---
 
@@ -377,15 +407,19 @@ If the control run matches jovial-avocet (≥63%) at 52K steps and Phase 3b matc
 
 **Criterion 2 — `mean_codebook_weight ≥ 0.15` at any eval checkpoint after step 15K**
 
-Definition: `mean_codebook_weight = 1 - mean_batch(w_pt)`. This replaces `bypass_rate`. The threshold of 0.15 means at least 15% of the final z_L comes from the codebook mixture on average — well below 50%, so the model has strong recurrence backup. At Phase 3a's peak bypass_rate of ~0.0012, the equivalent `mean_codebook_weight` would have been ~0.001. This criterion requires a 150× improvement.
+Definition: `mean_codebook_weight = 1 - mean_batch(w_pt)`. This replaces `bypass_rate`. The threshold of 0.15 is anchored as follows: at K=32, the uniform prior routing floor is 1/(K+1) = 1/33 ≈ 0.030. A `mean_codebook_weight` of 0.15 is 5× the uniform floor — well above a router that has learned nothing and is routing diffusely across all 33 experts. Below 5× uniform, codebook usage is consistent with noise; above it, the router has learned something about when to use the codebook.
 
-Justification: If the codebook provides no value and the model correctly learns this, w_pt → 1.0 and `mean_codebook_weight → 0`. Criterion 2 failing at ≥0.15 would indicate the codebook is not learning useful representations — a Phase 3b failure worth diagnosing before Phase 4.
+Justification: If the codebook provides no value and the model correctly learns this, w_pt → 1.0 and `mean_codebook_weight → 0`. Criterion 2 failing at ≥0.15 would indicate the codebook is not learning useful representations or the router is not being incentivized to use it — both are Phase 3b failures worth diagnosing before Phase 4.
 
-**Criterion 3 — `codebook_utilization ≥ 5/8 = 0.625` at step 10K consolidation**
+**Criterion 3 — `codebook_utilization`: observational, not pass/fail**
 
-Definition: fraction of K_modes=8 codebook entries with non-trivial routing weight (mean_batch(w_cb_k) > 0.01). Unlike Phase 3a where utilization was defined by k-means assignment, here utilization is defined by live routing weight.
+Definition: fraction of K_modes=32 codebook entries with non-trivial routing weight (mean_batch(w_cb_k) > 0.01) at any eval after step 15K.
 
-Justification: K=8 was chosen specifically to match the ~6 empirical modes. All 6+ modes should be active by step 10K once the codebook is initialized. If utilization is below 5/8 (fewer than 5 modes active), routing has collapsed and load-balancing loss needs to be increased.
+This criterion is observational because the goal of K=32 is disambiguation, not hitting a predetermined utilization number. The two informative outcomes are:
+- **Utilization saturates near ~6/32 (≈19%):** interpretation #1 from §2.2 is likely correct — the manifold has ~6 modes. Future runs should reduce K to 8 for efficiency.
+- **Utilization scales to 20+/32 (>60%):** the Phase 3a 6-code finding was an artifact of projection collapse or k-means init. The manifold is richer than assumed. Phase 4 design should consider a larger or more structured codebook.
+
+Either outcome is informative. The run fails on this dimension only if utilization cannot be measured (e.g., routing entropy is zero — all weight on passthrough), which is covered by Criterion 2.
 
 **Criterion 4 — No single eval checkpoint with `exact_accuracy < 0.600`**
 
@@ -405,18 +439,18 @@ The control run (`control-no-crystal`, warm-start no crystal) has not yet report
 
 **Risk 3 — Reconstruction loss weight `lambda_moe_recon`**
 
-Setting `lambda_moe_recon = 0.1` is carried over from `lambda_crystal = 0.1` in Phase 3a. But the reconstruction loss is computed over `[B, S, D]` (full spatial tensor), while the Phase 3a BCE was a scalar. The effective loss scale is different. An `L_recon` in fp32 units of mean MSE over `[81 × 512]` positions could be O(1)–O(10) depending on initialization; with lambda=0.1, this might dominate task loss early in training.
+Setting `lambda_moe_recon = 0.1` is carried over from `lambda_crystal = 0.1` in Phase 3a. But the reconstruction loss is now computed over the full spatial tensor `[B, S, D]` and is unweighted. `L_recon` as mean MSE over `[81 × 512]` positions early in training (before codebook warm-start) could be O(1)–O(10); with lambda=0.1, this might dominate task loss before the codebook converges.
 
-**Concrete question:** should `lambda_moe_recon` be swept (0.01, 0.05, 0.1) or should we normalize `L_recon` by `S × D`? I recommend computing `L_recon` as the **mean** over `[S, D]` (not sum), so its scale is comparable to a per-token reconstruction error. Launch with `lambda_moe_recon = 0.1`; if reconstruction loss dominates task loss at step 1000 (log ratio > 5×), halve it. This should be monitored closely in the first 2 eval checkpoints.
+**Concrete question:** I recommend computing `L_recon` as the **mean** over `[S, D]` (not sum), so its scale is comparable to a per-token reconstruction error. Launch with `lambda_moe_recon = 0.1`; if reconstruction loss exceeds task loss by >5× at eval step 5K (first post-bootstrap checkpoint), halve it. Monitor the `crystal/recon_loss` vs `train/task_loss` ratio at the first two eval checkpoints.
 
-**Risk 4 — Bootstrap consolidation produces wrong spatial initialisation**
+**Risk 4 — Spatial consolidation correctness (resolved structurally)**
 
-The first consolidation at step 5000 uses `CrystallizationBuffer` which currently stores only pooled (mean over seq) z_L, not full `[S, D]` spatial states. If Commit 7 (spatial consolidation) is deferred, `codebook_values` will not be warm-started from real spatial states — they will remain at random initialization until backprop shapes them. This may delay `mean_codebook_weight` reaching 0.15 by 5000–10000 steps compared to a properly warm-started run.
+This risk was listed in the original spec as a concern about deferring Commit 7. It is now resolved: Commit 3 (spatial consolidation) is part of the minimum viable launch set and must land before the training run. The `CrystallizationBuffer` will collect full `[B, S, D]` spatial z_L during bootstrap, and the first consolidation at step 5000 will initialize `codebook_values` from real k-means cluster centroids. There is no deferred version.
 
-**Decision required:** should Commit 7 be promoted to the minimum viable set (included before launch), or is the delayed warm-start acceptable? My assessment: Commit 7 is moderately complex (~80 LOC) and the delay in codebook warm-start is a known risk but not a failure mode. If Criterion 2 is met by step 20K regardless, it was not needed. Recommend deferring Commit 7 and monitoring.
+The remaining implementation risk is correctness: verify that the k-means assignment uses spatial z_L (not pooled keys) for centroid computation, and that `codebook_values` are correctly written to the SpatialMoECodebook parameter after consolidation. Commit 7 (test suite) includes a regression test for this.
 
 **Risk 5 — Phase 2 (columnar routing) interaction is untested**
 
 The forward dispatch in `CoralV3Inner` has four paths: baseline, PC-only, routing-only, PC+routing. Crystallization interacts with all four. Phase 3b modifies `_maybe_crystal_bypass_nograd` and the PCrecord path. The routing-only and PC+routing paths have not been tested with the new soft-mix interface and their `z_L` injection logic differs (they pass `routing_logits_L` from `L_level`). Since Phase 2 (columnar routing) has never been run to convergence (agate-cuckoo and curly-manatee both collapsed), the `pc=F, cr=T` and `pc=T, cr=T` dispatch paths are untested in practice.
 
-The spec does not propose running Phase 3b with columnar routing enabled (Phase 3a also ran `use_columnar_routing: false`). However, Commit 3 must update all four dispatch paths, not just the PC path. **Confirm with the researcher: is the routing-only dispatch path being maintained for future use, or can it be simplified/removed to reduce implementation surface?**
+The spec does not propose running Phase 3b with columnar routing enabled (Phase 3a also ran `use_columnar_routing: false`). However, Commit 4 must update all four dispatch paths, not just the PC path. **Confirm with the researcher: is the routing-only dispatch path being maintained for future use, or can it be simplified/removed to reduce implementation surface?**
