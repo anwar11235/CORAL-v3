@@ -1,0 +1,68 @@
+# Phase 3a': PC + crystallisation warm-started from poetic-giraffe (phase 1) checkpoint.
+# Purpose: validate single-codebook recognition-gated crystallisation adds
+# compute savings without accuracy regression vs Phase 1 baseline.
+
+# --- Data (required at launch time) ---
+data_path: ???
+
+# --- Architecture ---
+hidden_size: 512
+num_heads: 8
+expansion: 4.0
+H_cycles: 2
+L_cycles: 2
+H_layers: 4
+L_layers: 4
+halt_max_steps: 16
+halt_exploration_prob: 0.1
+pos_encodings: rope
+rope_theta: 10000.0
+rms_norm_eps: 1.0e-5
+forward_dtype: bfloat16
+puzzle_emb_ndim: 512
+
+# --- Mechanism flags ---
+use_predictive_coding: true
+use_columnar_routing: false
+use_crystallization: false
+
+# --- PC weights (match poetic-giraffe) ---
+lambda_pred: 0.1
+lambda_pi: 0.01
+
+# --- Crystallisation ---
+codebook_size: 256
+crystal_proj_dim: 128
+crystal_confidence_threshold: 0.8
+crystal_buffer_capacity: 10000
+crystal_bootstrap_steps: 5000
+crystal_consolidation_interval: 5000
+lambda_crystal: 0.1
+
+# --- Optimizer & schedule (match poetic-giraffe) ---
+lr: 7.0e-5
+puzzle_emb_lr: 7.0e-5
+weight_decay: 1.0
+puzzle_emb_weight_decay: 1.0
+beta1: 0.9
+beta2: 0.95
+loss_type: stablemax_cross_entropy
+lr_warmup_steps: 1000
+lr_min_ratio: 0.1
+
+# --- Training length ---
+global_batch_size: 384
+epochs: 20000
+eval_interval: 2000
+
+# --- Warm-start ---
+# Upload phase1_best_checkpoint_61pct.pt to /workspace/checkpoints/ before launching.
+resume_from_checkpoint: "/workspace/checkpoints/phase1_best_checkpoint_61pct.pt"
+
+# --- Run management ---
+seed: 42
+project_name: null   # auto: "Sudoku-extreme-1k-aug-1000 CORAL-v3"
+run_name: null       # auto-generated (coolname slug)
+checkpoint_path: null
+checkpoint_every_eval: false
+eval_save_outputs: []
