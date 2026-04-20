@@ -187,11 +187,12 @@ Key findings:
 - +2.4pp over poetic-giraffe (61.07% → 63.48%) — attribution unresolved (warm-start vs. crystal aux loss)
 - Control run config ready (`configs/phase3a_control_warmstart.yaml` on `control-no-crystal`, commit `03d32b3`) — awaiting Vast launch to disambiguate
 
-### Phase 3b — Architecture Design Complete (2026-04-19)
+### Phase 3b — Spec Revision 2 complete (2026-04-20); awaiting control result before implementation
 
-Architecture spec: `docs/CORAL_v3_Phase3b_MoE_Codebook_Spec.md` (branch: `moe-codebook-design`)
-Design: Soft MoE Spatial Codebook — K=8 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, reconstruction loss replaces BCE.
-Status: Review gate — awaiting researcher approval before implementation.
-Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization ≥ 5/8, no eval checkpoint below 0.60.
+Architecture spec: `docs/CORAL_v3_Phase3b_MoE_Codebook_Spec.md` (branch: `moe-codebook-design`, commit `faf8664`)
+Design: Soft MoE Spatial Codebook — K=32 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, reconstruction loss replaces BCE.
+Status: Spec finalized. Implementation blocked on control run result (decision gate §8/§9 Risk 1).
+Tightenings (2026-04-20): single-metric Euclidean k-means (Commit 3); hard 10× kill-threshold for L_recon (Risk 3); hard 1.5× action trigger for pred_error stratification (§4.1); stub columnar routing dispatch paths with NotImplementedError (Commit 4 + Risk 5 RESOLVED).
+Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization observational (K=32 for disambiguation), no eval checkpoint below 0.60.
 
 See `PHASE3A_CHANGES.md` for launch commands and metric tracking guide.
