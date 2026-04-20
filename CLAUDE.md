@@ -109,11 +109,15 @@ coral/
 │   ├── transformer_block.py   ✅ TransformerBlock (Post-Norm), TransformerBlockConfig
 │   ├── reasoning_module.py    ✅ ReasoningModule
 │   ├── coral_base.py          ✅ CoralInner, CoralConfig, InnerCarry
-│   │                             NEW: crystal_bootstrap_steps field
+│   │                             Phase 3b: moe_num_modes, lambda_moe_recon, lambda_moe_balance added
+│   │                             Phase 3a crystal_confidence_threshold/lambda_crystal marked DEPRECATED
 │   ├── coral_v3.py            ✅ CoralV3Inner — Phase 1/2/3 dispatcher
 │   │                             NEW: _crystal_gate_active flag, PredMetrics diagnostic fields
 │   │                             FIX: nearest_code.to(z_L.dtype) in bypass (flash-attn fp16/bf16 req)
-│   ├── crystallization.py     ✅ RecognitionNetwork, CrystallizationBuffer
+│   ├── crystallization.py     ✅ RecognitionNetwork (DEPRECATED), CrystallizationBuffer
+│   │                             Phase 3b Session 1: SpatialMoECodebook class added
+│   │                             Phase 3b Session 1: CrystallizationBuffer.add() extended with z_L_spatial
+│   │                             Phase 3b Session 1: CrystallizationBuffer.consolidate_spatial() added
 │   │                             PERF: CrystallizationBuffer rewritten with pre-allocated tensors;
 │   │                             vectorised add() eliminates Python loop (fixes ~11×/step slowdown)
 │   │                             PERF: @torch._dynamo.disable on add() (CPU-side op, no compile benefit)
@@ -178,8 +182,9 @@ Key findings:
 ### Phase 3b — Architecture Design Complete (2026-04-19)
 
 Architecture spec: `docs/CORAL_v3_Phase3b_MoE_Codebook_Spec.md` (branch: `moe-codebook-design`)
-Design: Soft MoE Spatial Codebook — K=8 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, reconstruction loss replaces BCE.
-Status: Review gate — awaiting researcher approval before implementation.
-Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization ≥ 5/8, no eval checkpoint below 0.60.
+Design: Soft MoE Spatial Codebook — K=32 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, unweighted reconstruction loss + always-active L_lb.
+Status: Session 1 complete (Commits 1–3 landed). Session 2 next: CoralV3Inner integration, loss head update, config YAML.
+Session 1 modules: SpatialMoECodebook, CoralConfig MoE fields, CrystallizationBuffer.consolidate_spatial().
+Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization observational (K=32 for disambiguation), no eval checkpoint below 0.60.
 
 See `PHASE3A_CHANGES.md` for launch commands and metric tracking guide.
