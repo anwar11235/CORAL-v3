@@ -312,6 +312,9 @@ class CrystallizationBuffer:
         # Lazily allocated on first add() — we need key_dim and value_dim from inputs.
         self.keys: Optional[torch.Tensor] = None    # [capacity, key_dim]  on CPU
         self.values: Optional[torch.Tensor] = None  # [capacity, value_dim] on CPU
+        # Spatial buffer for Phase 3b k-means consolidation. CPU only; never on GPU.
+        # Memory: capacity × seq_len × l_dim × 4 bytes ≈ 1.65 GB for default capacity.
+        self.spatial_buffer: Optional[torch.Tensor] = None  # [capacity, seq_len, l_dim] float32
         self.pointer: int = 0
         self.size: int = 0  # number of valid entries written, capped at capacity
 
@@ -320,15 +323,28 @@ class CrystallizationBuffer:
             self.keys = torch.zeros(self.capacity, key_dim, dtype=torch.float32)
             self.values = torch.zeros(self.capacity, value_dim, dtype=torch.float32)
 
+    def _lazy_init_spatial(self, seq_len: int, l_dim: int) -> None:
+        if self.spatial_buffer is None:
+            self.spatial_buffer = torch.zeros(
+                self.capacity, seq_len, l_dim, dtype=torch.float32
+            )
+
     @torch._dynamo.disable
-    def add(self, keys: torch.Tensor, values: torch.Tensor) -> None:
+    def add(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        z_L_spatial: Optional[torch.Tensor] = None,
+    ) -> None:
         """Add a batch of (key, value) pairs via vectorised slice assignment.
 
         Single GPU→CPU transfer per call; no Python loop over batch elements.
 
         Args:
-            keys:   [B, key_dim]   — recognition keys (may be on any device).
-            values: [B, value_dim] — pooled converged L-states (mean over seq dim).
+            keys:        [B, key_dim]   — recognition keys (may be on any device).
+            values:      [B, value_dim] — pooled converged L-states (mean over seq dim).
+            z_L_spatial: [B, S, D]     — full per-position L-states for spatial k-means.
+                                         Optional; only stored when provided.
         """
         keys_cpu = keys.detach().to(dtype=torch.float32, device="cpu", non_blocking=True)
         values_cpu = values.detach().to(dtype=torch.float32, device="cpu", non_blocking=True)
@@ -341,6 +357,8 @@ class CrystallizationBuffer:
         if B > self.capacity:
             keys_cpu = keys_cpu[-self.capacity :]
             values_cpu = values_cpu[-self.capacity :]
+            if z_L_spatial is not None:
+                z_L_spatial = z_L_spatial[-self.capacity :]
             B = self.capacity
 
         # Ring-buffer destination indices: [pointer, pointer+1, ..., pointer+B-1] % capacity
@@ -348,6 +366,13 @@ class CrystallizationBuffer:
 
         self.keys[indices] = keys_cpu
         self.values[indices] = values_cpu
+
+        if z_L_spatial is not None:
+            z_L_cpu = z_L_spatial.detach().to(
+                dtype=torch.float32, device="cpu", non_blocking=True
+            )
+            self._lazy_init_spatial(z_L_cpu.shape[1], z_L_cpu.shape[2])
+            self.spatial_buffer[indices] = z_L_cpu
 
         self.pointer = int((self.pointer + B) % self.capacity)
         self.size = min(self.size + B, self.capacity)
@@ -427,6 +452,68 @@ class CrystallizationBuffer:
         """Reset the buffer (call after consolidation). Keeps tensors allocated for reuse."""
         self.pointer = 0
         self.size = 0
+        # Zero spatial buffer to prevent stale entries from influencing the next bootstrap.
+        if self.spatial_buffer is not None:
+            self.spatial_buffer.zero_()
+
+    def consolidate_spatial(
+        self, k_modes: int, num_iterations: int = 100
+    ) -> Optional[Tuple[torch.Tensor, int]]:
+        """Run Euclidean k-means on buffered spatial z_L to initialise codebook_values.
+
+        Forgy initialisation (k_modes random samples as starting centroids), then
+        num_iterations of Lloyd's algorithm on CPU. All operations in float32.
+
+        Args:
+            k_modes:        Number of cluster centroids (= moe_num_modes, typically 32).
+            num_iterations: Lloyd's iterations (default 100).
+
+        Returns:
+            (centroids, utilization) where centroids is [k_modes, seq_len, l_dim]
+            float32 CPU tensor and utilization is the count of non-empty clusters
+            after the final assignment, or None if the buffer has insufficient data.
+        """
+        if self.spatial_buffer is None or self.size < k_modes:
+            return None
+
+        N = self.size
+        all_spatial = self.spatial_buffer[:N]           # [N, S, D]
+        S, D = all_spatial.shape[1], all_spatial.shape[2]
+        data_flat = all_spatial.view(N, -1).clone()     # [N, S*D] — clone to avoid aliasing
+
+        # Forgy init: pick k_modes random samples as initial centroids
+        perm = torch.randperm(N)[:k_modes]
+        centroids_flat = data_flat[perm].clone()        # [K, S*D]
+
+        assignments = torch.zeros(N, dtype=torch.long)
+        SD = data_flat.shape[1]
+
+        with torch.no_grad():
+            for _ in range(num_iterations):
+                # Euclidean distance matrix [N, K] via torch.cdist
+                dists = torch.cdist(data_flat, centroids_flat)   # [N, K]
+                assignments = dists.argmin(dim=1)                # [N]
+
+                # Vectorised centroid update via scatter_add (no Python loop over k)
+                new_centroids = torch.zeros(k_modes, SD, dtype=torch.float32)
+                counts = torch.zeros(k_modes, dtype=torch.float32)
+
+                new_centroids.scatter_add_(
+                    0,
+                    assignments.unsqueeze(1).expand(-1, SD),
+                    data_flat,
+                )
+                counts.scatter_add_(0, assignments, torch.ones(N, dtype=torch.float32))
+
+                filled = counts > 0
+                new_centroids[filled] /= counts[filled].unsqueeze(1)
+                # Keep old centroid for any empty cluster (avoids dead centroids resetting to 0)
+                new_centroids[~filled] = centroids_flat[~filled]
+                centroids_flat = new_centroids
+
+        utilization = int((assignments.bincount(minlength=k_modes) > 0).sum().item())
+        centroids = centroids_flat.view(k_modes, S, D)
+        return centroids, utilization
 
 
 # ---------------------------------------------------------------------------
