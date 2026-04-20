@@ -300,21 +300,15 @@ class CoralV3ACT(nn.Module):
             if pred_metrics.routing_logits_H is not None:
                 outputs["routing_logits_H"] = pred_metrics.routing_logits_H  # type: ignore[assignment]
                 outputs["routing_logits_L"] = pred_metrics.routing_logits_L  # type: ignore[assignment]
-            if pred_metrics.crystal_supervision_loss_final is not None:
-                outputs["crystal_supervision_loss_final"] = pred_metrics.crystal_supervision_loss_final  # type: ignore[assignment]
-            outputs["crystal_bypass_count"] = torch.tensor(
-                float(pred_metrics.crystal_bypass_count), device=logits.device
-            )
+            if pred_metrics.moe_recon_loss is not None:
+                outputs["moe_recon_loss"] = pred_metrics.moe_recon_loss  # type: ignore[assignment]
+                outputs["moe_lb_loss"] = pred_metrics.moe_lb_loss        # type: ignore[assignment]
             if self.config.use_crystallization:
-                outputs["crystal_confidence_mean"] = torch.tensor(
-                    pred_metrics.crystal_confidence_mean,
+                outputs["moe_passthrough_weight"] = torch.tensor(
+                    pred_metrics.moe_passthrough_weight,
                     device=logits.device,
                     dtype=torch.float32,
                 )
-                if pred_metrics.crystal_reconstruction_error is not None:
-                    outputs["crystal_reconstruction_error"] = pred_metrics.crystal_reconstruction_error.to(logits.device)
-                if pred_metrics.crystal_target_confidence_mean is not None:
-                    outputs["crystal_target_confidence_mean"] = pred_metrics.crystal_target_confidence_mean.to(logits.device)
 
         # --- 3. Halting logic ---
         with torch.no_grad():
