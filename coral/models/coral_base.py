@@ -76,17 +76,11 @@ class CoralConfig(BaseModel):
 
     # Phase 3: recognition-gated crystallization
     use_crystallization: bool = False
-    codebook_size: int = 256              # K — pooled codebook entries (used by CrystallizationBuffer key init)
-    crystal_proj_dim: int = 128           # projection dim for recognition key
-    # DEPRECATED: used by Phase 3a BCE gate path in CoralV3Inner. Kept until Session 2
-    # removes the RecognitionNetwork integration. Do not use in new code.
-    crystal_confidence_threshold: float = 0.8
-    crystal_buffer_capacity: int = 10000  # ring-buffer capacity for consolidation
-    crystal_consolidation_interval: int = 10   # epochs between consolidation calls
-    crystal_bootstrap_steps: int = 5000    # steps before first consolidation / gate activation
-    # DEPRECATED: replaced by lambda_moe_recon + lambda_moe_balance. Kept until Session 2
-    # removes the CoralV3LossHead BCE path. Do not use in new code.
-    lambda_crystal: float = 0.1
+    codebook_size: int = 256              # K — pooled codebook entries (kept for CrystallizationBuffer key init)
+    crystal_proj_dim: int = 128           # projection dim for recognition key (proj_h, proj_l)
+    crystal_buffer_capacity: int = 10000  # ring-buffer capacity for spatial k-means bootstrap
+    crystal_consolidation_interval: int = 10   # steps between consolidation calls
+    crystal_bootstrap_steps: int = 5000    # steps before first spatial k-means consolidation
 
     # Phase 3b: Soft MoE spatial codebook
     moe_num_modes: int = 32              # K_modes — number of spatial codebook experts

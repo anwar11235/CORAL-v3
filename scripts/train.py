@@ -95,15 +95,16 @@ class TrainConfig(pydantic.BaseModel):
     column_warmup_steps: int = 10000  # steps to anneal from start_k → active_columns; 0 = skip
     column_warmup_start_k: int = 8    # k at step 0 (defaults to S = num_columns)
 
-    # Phase 3: recognition-gated crystallization
+    # Phase 3b: Soft MoE Crystallization
     use_crystallization: bool = False
     codebook_size: int = 256
     crystal_proj_dim: int = 128
-    crystal_confidence_threshold: float = 0.8
     crystal_buffer_capacity: int = 10000
-    crystal_consolidation_interval: int = 5000  # steps between codebook consolidations; 0 = never
-    crystal_bootstrap_steps: int = 5000    # steps before first consolidation / gate supervision
-    lambda_crystal: float = 0.1
+    crystal_consolidation_interval: int = 5000  # steps between spatial k-means runs; 0 = never
+    crystal_bootstrap_steps: int = 5000    # steps before first k-means consolidation
+    moe_num_modes: int = 32               # K_modes — spatial codebook experts
+    lambda_moe_recon: float = 0.1         # weight for unweighted reconstruction loss
+    lambda_moe_balance: float = 0.01      # weight for codebook load-balancing KL loss
 
     # Warm-start
     resume_from_checkpoint: Optional[str] = None  # path to a .pt state_dict to warm-start from
@@ -180,15 +181,16 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
         num_columns=config.num_columns,
         active_columns=config.active_columns,
         lambda_balance=config.lambda_balance,
-        # Phase 3: crystallization
+        # Phase 3b: Soft MoE crystallization
         use_crystallization=config.use_crystallization,
         codebook_size=config.codebook_size,
         crystal_proj_dim=config.crystal_proj_dim,
-        crystal_confidence_threshold=config.crystal_confidence_threshold,
         crystal_buffer_capacity=config.crystal_buffer_capacity,
         crystal_consolidation_interval=config.crystal_consolidation_interval,
         crystal_bootstrap_steps=config.crystal_bootstrap_steps,
-        lambda_crystal=config.lambda_crystal,
+        moe_num_modes=config.moe_num_modes,
+        lambda_moe_recon=config.lambda_moe_recon,
+        lambda_moe_balance=config.lambda_moe_balance,
     )
 
     _any_v3 = config.use_predictive_coding or config.use_columnar_routing or config.use_crystallization
@@ -418,10 +420,9 @@ def evaluate(
                     m = {metric_keys[i]: mv[sid, i] for i in range(len(metric_keys))}
                     count = max(m.pop("count"), 1)
                     m = {k: v / count for k, v in m.items()}
-                    # Convert crystal_bypass_count → crystal_bypass_rate (eval only)
-                    if "crystal_bypass_count" in m:
-                        h_bypassable = max(config.H_cycles - 1, 1)
-                        m["crystal_bypass_rate"] = m.pop("crystal_bypass_count") / h_bypassable
+                    # Convert moe_passthrough_weight to codebook_weight for logging clarity
+                    if "crystal/mean_passthrough_weight" in m:
+                        m["crystal/mean_codebook_weight"] = 1.0 - m["crystal/mean_passthrough_weight"]
                     result[sname] = m
                 return result
 
@@ -496,7 +497,7 @@ def load_warmstart_checkpoint(
     Designed for cross-phase warm-starts (e.g., Phase 1 → Phase 3) where the
     source checkpoint does not contain crystallization module weights.  Uses
     strict=False so only the keys present in the checkpoint are loaded; new
-    modules (RecognitionNetwork, CrystallizationBuffer parameters) keep their
+    modules (SpatialMoECodebook, CrystallizationBuffer parameters) keep their
     random initialisation.
 
     Handles torch.compile prefix mismatches on both sides: if either the
@@ -632,7 +633,7 @@ def main(hydra_config: DictConfig) -> None:
     state = init_train_state(config, train_meta, world_size=WORLD_SIZE)
 
     # Warm-start: load backbone weights from a prior-phase checkpoint.
-    # Missing keys (new modules like RecognitionNetwork) are expected and logged.
+    # Missing keys (new modules like SpatialMoECodebook) are expected and logged.
     if config.resume_from_checkpoint:
         state = load_warmstart_checkpoint(state, config.resume_from_checkpoint, RANK)
 
@@ -652,10 +653,10 @@ def main(hydra_config: DictConfig) -> None:
     latest_checkpoint_path: Optional[str] = None
 
     # Bootstrap-phase state — persists across eval checkpoints.
-    # first_consolidation_done tracks whether the first full-replace consolidation
-    # has succeeded; until then the crystal gate receives no BCE supervision.
+    # first_consolidation_done tracks whether the first spatial k-means consolidation
+    # has succeeded; until then the codebook mask is active (w_pt forced to 1.0).
     first_consolidation_done: bool = False
-    # When crystal_bootstrap_steps == 0 the gate is active from step 0 (backward compat).
+    # When crystal_bootstrap_steps == 0 consolidation is skipped entirely (immediate live).
     if config.use_crystallization and config.crystal_bootstrap_steps == 0:
         first_consolidation_done = True
 
@@ -705,9 +706,9 @@ def main(hydra_config: DictConfig) -> None:
                         )
                     if usage is not None and not first_consolidation_done:
                         first_consolidation_done = True
-                        inner._crystal_gate_active = True
+                        # consolidate_codebook() already deactivates bootstrap mask internally
                         if RANK == 0:
-                            print("[CORAL-v3] Crystal gate activated — BCE supervision enabled.")
+                            print("[CORAL-v3] Spatial k-means consolidation done — MoE codebook live.")
                     if usage is not None and RANK == 0:
                         wandb.log(
                             {"train/crystal/codebook_utilisation_frac": usage},
