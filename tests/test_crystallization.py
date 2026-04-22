@@ -149,6 +149,70 @@ def test_moe_codebook_recon_loss_unweighted_gradient():
 
 
 # ---------------------------------------------------------------------------
+# L_lb Option Y unit tests (Phase 3c)
+# ---------------------------------------------------------------------------
+
+
+def _make_w_from_probs(probs: list) -> torch.Tensor:
+    """Create a [1, len(probs)] w tensor from a list of probabilities."""
+    t = torch.tensor(probs, dtype=torch.float32).unsqueeze(0)
+    assert abs(t.sum().item() - 1.0) < 1e-5
+    return t
+
+
+def test_lb_option_y_zero_at_uniform():
+    """L_lb ≈ 0 when routing is uniform over K+1 experts."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    w = torch.full((BATCH, K + 1), 1.0 / (K + 1))
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() < 1e-5, f"L_lb should be ~0 at uniform K+1, got {L_lb.item()}"
+
+
+def test_lb_option_y_large_at_passthrough_dominance():
+    """L_lb is large and positive when all weight is on passthrough."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    # w_pt = 1, all codebook weights = 0
+    w = torch.zeros(BATCH, K + 1)
+    w[:, -1] = 1.0
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() > 0.5, f"L_lb should be large at passthrough dominance, got {L_lb.item()}"
+
+
+def test_lb_option_y_large_at_single_mode_dominance():
+    """L_lb is large and positive when all weight is on one codebook mode."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    w = torch.zeros(BATCH, K + 1)
+    w[:, 3] = 1.0  # single codebook mode
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() > 0.5, f"L_lb should be large at single-mode dominance, got {L_lb.item()}"
+
+
+def test_lb_option_y_nonzero_at_uniform_codebook_zero_passthrough():
+    """Uniform codebook with w_pt=0 is NOT uniform over K+1 → L_lb > 0."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    # w_pt = 0, uniform over K codebook modes (1/K each, not 1/(K+1))
+    w = torch.zeros(BATCH, K + 1)
+    w[:, :K] = 1.0 / K
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() > 1e-4, (
+        f"L_lb should be > 0 for uniform-codebook+zero-passthrough (not uniform over K+1), "
+        f"got {L_lb.item()}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CrystallizationBuffer
 # ---------------------------------------------------------------------------
 

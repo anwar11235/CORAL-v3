@@ -146,14 +146,15 @@ class SpatialMoECodebook(nn.Module):
         # Unweighted reconstruction loss — mean over [B, S, D]
         L_recon = (z_L_final.detach().float() - z_bypass.float()).pow(2).mean()
 
-        # KL(mean_batch(w_cb) || uniform(K_modes)) — load-balancing on codebook entries only.
-        # w_cb does not sum to 1 across K_modes (passthrough weight is excluded), so we
-        # normalise before computing KL to get a valid probability distribution.
-        w_cb = w[:, : self.K_modes].float()      # [B, K_modes]
-        w_cb_mean = w_cb.mean(dim=0)             # [K_modes]; sum ≤ 1 due to passthrough
-        w_cb_norm = w_cb_mean / w_cb_mean.sum().clamp(min=1e-8)  # [K_modes], sums to 1
-        # KL(p || uniform(K)) = sum_k p_k * log(p_k * K) ≥ 0 by Gibbs' inequality
-        L_lb = (w_cb_norm * torch.log(w_cb_norm.clamp(min=1e-8) * float(self.K_modes))).sum()
+        # L_lb: non-normalized KL over all K+1 experts (passthrough + K_modes codebook).
+        # `w` is a proper softmax distribution, so w.mean(dim=0) is also valid. No
+        # normalization needed — penalizes both passthrough dominance and uniform-codebook
+        # equilibrium (Option Y per Phase 3c spec §3.1).
+        w_mean = w.float().mean(dim=0)           # [K_modes + 1] — includes passthrough
+        K_plus_one = float(w_mean.shape[-1])
+        target = torch.full_like(w_mean, 1.0 / K_plus_one)
+        eps = 1e-10
+        L_lb = (w_mean * (torch.log(w_mean + eps) - torch.log(target))).sum()
 
         return L_recon, L_lb
 
