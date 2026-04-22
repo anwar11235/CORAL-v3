@@ -122,6 +122,7 @@ class SpatialMoECodebook(nn.Module):
 
         return w, z_bypass, key
 
+    @torch.compiler.disable(recursive=False)
     def moe_losses(
         self,
         z_L_final: torch.Tensor,
