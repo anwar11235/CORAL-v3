@@ -700,10 +700,16 @@ def main(hydra_config: DictConfig) -> None:
                     is_first = not first_consolidation_done
                     usage = inner.consolidate_codebook(is_first_consolidation=is_first)
                     if RANK == 0:
-                        print(
-                            f"[CORAL-v3] Codebook consolidation at step {state.step}"
-                            f" (first={is_first}, usage={usage})"
-                        )
+                        if usage is None:
+                            print(
+                                f"[CORAL-v3] Consolidation skipped at step {state.step}: "
+                                f"buffer disabled post-bootstrap (backprop-only update path active)"
+                            )
+                        else:
+                            print(
+                                f"[CORAL-v3] Codebook consolidation at step {state.step}"
+                                f" (first={is_first}, usage={usage})"
+                            )
                     if usage is not None and not first_consolidation_done:
                         first_consolidation_done = True
                         # consolidate_codebook() already deactivates bootstrap mask internally
