@@ -440,9 +440,12 @@ class CoralV3LossHead(nn.Module):
                 for col_idx in range(avg_probs.shape[0]):
                     metrics[f"col_{col_idx}_freq"] = avg_probs[col_idx]
 
-        # ---- MoE crystallization losses (Phase 3b, training only, post-bootstrap) ----
+        # ---- MoE crystallization losses (Phase 3b/3c, post-bootstrap) ----
         moe_recon_loss = outputs.get("moe_recon_loss")
         moe_lb_loss = outputs.get("moe_lb_loss")
+        # L_recon is logged during both train and eval; L_lb only during train.
+        if moe_recon_loss is not None:
+            metrics["crystal/recon_loss"] = moe_recon_loss.detach()
         if moe_recon_loss is not None and moe_lb_loss is not None:
             cfg = self.model.config  # type: ignore[attr-defined]
             total_loss = (
@@ -450,7 +453,6 @@ class CoralV3LossHead(nn.Module):
                 + cfg.lambda_moe_recon * moe_recon_loss
                 + cfg.lambda_moe_balance * moe_lb_loss
             )
-            metrics["crystal/recon_loss"] = moe_recon_loss.detach()
             metrics["crystal/lb_loss"] = moe_lb_loss.detach()
 
         # Log MoE routing scalars
@@ -458,9 +460,12 @@ class CoralV3LossHead(nn.Module):
         if moe_pt is not None:
             metrics["crystal/mean_passthrough_weight"] = moe_pt.detach()
             metrics["crystal/mean_codebook_weight"] = (1.0 - moe_pt).detach()
-            # Routing entropy and utilization require per-batch w — log as 0.0 placeholder
-            # until per-batch logging is wired through in Session 2 follow-up.
-            # TODO(phase3b): compute routing_entropy and codebook_utilization from w tensor
+        moe_entropy = outputs.get("moe_routing_entropy")
+        if moe_entropy is not None:
+            metrics["crystal/routing_entropy"] = moe_entropy.detach()
+        moe_util = outputs.get("moe_codebook_util_frac")
+        if moe_util is not None:
+            metrics["crystal/codebook_utilisation_frac"] = moe_util.detach()
 
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 

@@ -461,8 +461,8 @@ def test_crystal_training_buffer_records():
     assert len(model.crystal_buffer) > 0
 
 
-def test_crystal_eval_moe_losses_none():
-    """In eval mode, MoE losses should be None (no gradient needed)."""
+def test_crystal_eval_moe_losses_recon_only():
+    """In eval mode, L_recon is computed (for logging) but L_lb is None (no grad needed)."""
     model = make_v3_model(
         use_predictive_coding=True,
         use_crystallization=True,
@@ -474,8 +474,9 @@ def test_crystal_eval_moe_losses_none():
     carry = make_inner_carry(model)
     with torch.no_grad():
         _, _, _, pm = model(carry, make_batch())
-    assert pm.moe_recon_loss is None
-    assert pm.moe_lb_loss is None
+    assert pm.moe_recon_loss is not None, "eval should compute L_recon for logging"
+    assert not pm.moe_recon_loss.requires_grad, "eval L_recon must be detached"
+    assert pm.moe_lb_loss is None, "L_lb not needed in eval"
 
 
 # ---------------------------------------------------------------------------

@@ -82,6 +82,8 @@ class PredMetrics:
     moe_recon_loss: Optional[torch.Tensor] = field(default=None)
     moe_lb_loss: Optional[torch.Tensor] = field(default=None)
     moe_passthrough_weight: float = field(default=1.0)
+    moe_routing_entropy: Optional[float] = field(default=None)
+    moe_codebook_util_frac: Optional[float] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +182,19 @@ class CoralV3Inner(CoralInner):
         w: Optional[torch.Tensor],
         z_bypass: Optional[torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Delegate to moe_codebook.moe_losses (training only, post-bootstrap)."""
-        if not self.config.use_crystallization or not self.training:
+        """Delegate to moe_codebook.moe_losses (post-bootstrap only).
+
+        During eval, returns (L_recon, None) — recon is cheap to compute and
+        useful for eval/crystal/recon_loss logging; L_lb is skipped (no grad needed).
+        """
+        if not self.config.use_crystallization:
             return None, None
         if w is None or z_bypass is None:
             return None, None
-        return self.moe_codebook.moe_losses(z_L_final, w, z_bypass)
+        L_recon, L_lb = self.moe_codebook.moe_losses(z_L_final, w, z_bypass)
+        if not self.training:
+            return L_recon.detach(), None
+        return L_recon, L_lb
 
     @torch.compiler.disable(recursive=False)
     def _maybe_record_crystal(
@@ -359,8 +368,21 @@ class CoralV3Inner(CoralInner):
         precision_means.append(pi_final.detach().mean())
 
         moe_pt_weight: float = 1.0
+        moe_routing_entropy: Optional[float] = None
+        moe_codebook_util_frac: Optional[float] = None
         if w is not None:
             moe_pt_weight = float(w[:, -1].mean().item())
+            with torch.no_grad():
+                w_f = w.float()
+                eps = 1e-10
+                moe_routing_entropy = float(
+                    -(w_f * torch.log(w_f + eps)).sum(dim=-1).mean().item()
+                )
+                K_modes = self.config.moe_num_modes
+                w_cb_mean = w_f[:, :K_modes].mean(dim=0)  # [K_modes]
+                moe_codebook_util_frac = float(
+                    (w_cb_mean > 0.01).float().mean().item()
+                )
 
         new_carry = InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
@@ -374,5 +396,7 @@ class CoralV3Inner(CoralInner):
             moe_recon_loss=moe_recon_loss,
             moe_lb_loss=moe_lb_loss,
             moe_passthrough_weight=moe_pt_weight,
+            moe_routing_entropy=moe_routing_entropy,
+            moe_codebook_util_frac=moe_codebook_util_frac,
         )
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), pred_metrics

@@ -302,6 +302,7 @@ class CoralV3ACT(nn.Module):
                 outputs["routing_logits_L"] = pred_metrics.routing_logits_L  # type: ignore[assignment]
             if pred_metrics.moe_recon_loss is not None:
                 outputs["moe_recon_loss"] = pred_metrics.moe_recon_loss  # type: ignore[assignment]
+            if pred_metrics.moe_lb_loss is not None:
                 outputs["moe_lb_loss"] = pred_metrics.moe_lb_loss        # type: ignore[assignment]
             if self.config.use_crystallization:
                 outputs["moe_passthrough_weight"] = torch.tensor(
@@ -309,6 +310,18 @@ class CoralV3ACT(nn.Module):
                     device=logits.device,
                     dtype=torch.float32,
                 )
+                if pred_metrics.moe_routing_entropy is not None:
+                    outputs["moe_routing_entropy"] = torch.tensor(
+                        pred_metrics.moe_routing_entropy,
+                        device=logits.device,
+                        dtype=torch.float32,
+                    )
+                if pred_metrics.moe_codebook_util_frac is not None:
+                    outputs["moe_codebook_util_frac"] = torch.tensor(
+                        pred_metrics.moe_codebook_util_frac,
+                        device=logits.device,
+                        dtype=torch.float32,
+                    )
 
         # --- 3. Halting logic ---
         with torch.no_grad():
