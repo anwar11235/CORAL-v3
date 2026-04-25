@@ -500,6 +500,59 @@ def save_checkpoint(
 # ---------------------------------------------------------------------------
 
 
+def _remap_checkpoint_keys_for_submodule_compile(
+    ckpt: dict,
+    target_model: nn.Module,
+) -> tuple:
+    """Insert _orig_mod. into checkpoint keys where target_model has compiled sub-modules.
+
+    When torch.compile() is applied to individual sub-modules (Approach A), PyTorch
+    registers the original module under _orig_mod, which shifts parameter names:
+        model.inner.H_level.layers.0.weight
+        → model.inner.H_level._orig_mod.layers.0.weight
+
+    A checkpoint saved without sub-module compile (or with top-level compile,
+    after stripping the root prefix) has keys in the first form; this function
+    rewrites them to match the second form so load_state_dict finds the right keys.
+
+    Idempotent: keys that already have _orig_mod. at the boundary are left
+    unchanged, so checkpoints saved from sub-module-compiled models reload
+    without double-insertion.
+
+    Args:
+        ckpt:         Checkpoint key→tensor dict (top-level _orig_mod. already stripped).
+        target_model: The model about to receive the weights.
+
+    Returns:
+        (remapped_ckpt, affected_prefixes) — adjusted dict and list of sub-module
+        dot-prefixes where _orig_mod. was inserted (empty if no change needed).
+    """
+    compiled_prefixes: list = [
+        name + "."
+        for name, mod in target_model.named_modules()
+        if name and "_orig_mod" in {n for n, _ in mod.named_children()}
+    ]
+    if not compiled_prefixes:
+        return ckpt, []
+
+    # Longest-first so a nested compile matches the innermost boundary first.
+    compiled_prefixes.sort(key=len, reverse=True)
+
+    new_ckpt: dict = {}
+    remapped: set = set()
+    for k, v in ckpt.items():
+        new_k = k
+        for prefix in compiled_prefixes:
+            if k.startswith(prefix):
+                remainder = k[len(prefix):]
+                if not remainder.startswith("_orig_mod."):
+                    new_k = prefix + "_orig_mod." + remainder
+                    remapped.add(prefix)
+                break
+        new_ckpt[new_k] = v
+    return new_ckpt, sorted(remapped)
+
+
 def load_warmstart_checkpoint(
     state: TrainState,
     checkpoint_path: str,
@@ -513,10 +566,11 @@ def load_warmstart_checkpoint(
     modules (SpatialMoECodebook, CrystallizationBuffer parameters) keep their
     random initialisation.
 
-    Handles torch.compile prefix mismatches on both sides: if either the
-    checkpoint or the current model was wrapped by torch.compile, keys are
-    normalised before load_state_dict so backbone weights match regardless
-    of compile state at save/load time.
+    Handles three torch.compile prefix patterns automatically:
+      1. Top-level compiled checkpoint (_orig_mod. at root) → sub-module compiled model:
+         strip root prefix, then insert _orig_mod. at H_level / L_level boundaries.
+      2. Uncompiled checkpoint → sub-module compiled model: insert sub-module prefixes.
+      3. Sub-module compiled checkpoint → sub-module compiled model: idempotent, no change.
 
     Optimizer state is NOT restored — optimizers always start fresh.  This is
     correct for cross-phase warm-starts where the parameter set has changed.
@@ -539,24 +593,37 @@ def load_warmstart_checkpoint(
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         ckpt = ckpt["model_state_dict"]
 
-    # Strip torch.compile "_orig_mod." prefix from checkpoint keys if present.
-    # Checkpoints saved from compiled models have this prefix; uncompiled
-    # models expect keys without it.
+    # Strip top-level torch.compile "_orig_mod." prefix.
+    # Checkpoints saved with torch.compile(whole_model) carry this prefix.
     if any(k.startswith("_orig_mod.") for k in ckpt.keys()):
         if rank == 0:
-            print("[CORAL-v3] Stripping '_orig_mod.' prefix from checkpoint keys (source was compiled)")
+            print("[CORAL-v3] Stripping root '_orig_mod.' prefix from checkpoint keys "
+                  "(source was top-level compiled)")
         ckpt = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
                 for k, v in ckpt.items()}
 
-    # Unwrap torch.compile on the target model side as well (defensive:
-    # works whether current model is compiled or not).
+    # Unwrap torch.compile on the target model side (defensive; handles the case
+    # where the whole model was compiled rather than individual sub-modules).
     target_model = state.model
     if hasattr(target_model, "_orig_mod"):
         target_model = target_model._orig_mod  # type: ignore[attr-defined]
 
+    # Insert _orig_mod. at sub-module compile boundaries.
+    # Under Approach A, H_level and L_level are compiled independently; their
+    # parameter keys gain a _orig_mod. segment that older checkpoints lack.
+    ckpt, remapped_prefixes = _remap_checkpoint_keys_for_submodule_compile(ckpt, target_model)
+    if rank == 0 and remapped_prefixes:
+        print(f"[CORAL-v3] Remapped checkpoint keys: inserted '_orig_mod.' at "
+              f"sub-module boundaries {remapped_prefixes}")
+
     result = target_model.load_state_dict(ckpt, strict=False)
 
     if rank == 0:
+        if result.missing_keys or result.unexpected_keys:
+            model_sample = sorted(target_model.state_dict().keys())[:5]
+            ckpt_sample = sorted(ckpt.keys())[:5]
+            print(f"[CORAL-v3] Model state_dict (first 5): {model_sample}")
+            print(f"[CORAL-v3] Checkpoint keys   (first 5): {ckpt_sample}")
         if result.missing_keys:
             print(
                 f"[CORAL-v3] Warm-start: {len(result.missing_keys)} keys not in checkpoint "
