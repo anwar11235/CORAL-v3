@@ -204,7 +204,20 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
             model = ACTLossHead(inner_model, loss_type=config.loss_type)
 
         if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=config.use_columnar_routing)  # type: ignore[assignment]
+            if _any_v3:
+                # Compile only the hot transformer kernels (H_level, L_level) to avoid the
+                # graph-break recompile storm:  the disabled moe_losses() returns new scalar
+                # tensors each call; when the entire model is torch.compiled, dynamo resumes
+                # at act.py:277 and guards on PredMetrics.moe_lb_loss object identity —
+                # failing every call and hitting cache_size_limit=64.
+                # Compiling H_level / L_level as standalone sub-modules gives ~same speedup
+                # (they contain all the attention + FFN compute) while the outer ACT / loss
+                # code runs eagerly with no graph breaks.
+                _inner = inner_model.inner  # CoralV3Inner (inherits H_level, L_level from CoralInner)
+                _inner.H_level = torch.compile(_inner.H_level)  # type: ignore[assignment]
+                _inner.L_level = torch.compile(_inner.L_level)  # type: ignore[assignment]
+            else:
+                model = torch.compile(model, dynamic=config.use_columnar_routing)  # type: ignore[assignment]
 
         if world_size > 1:
             with torch.no_grad():

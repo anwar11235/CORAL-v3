@@ -235,6 +235,7 @@ class CoralV3ACT(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 
+    @torch.compiler.disable(recursive=False)
     def forward(
         self,
         carry: ACTCarry,
@@ -253,6 +254,14 @@ class CoralV3ACT(nn.Module):
                 "pi_final"           — [B, seq_len, hidden_size] with grad
                 "pred_error_norm"    — scalar (mean over all steps, detached)
                 "precision_mean"     — scalar (mean over all steps, detached)
+
+        Note: @torch.compiler.disable prevents dynamo from tracing through this
+        function when the outer model is compiled.  The hot transformer kernels
+        (H_level, L_level) are compiled as standalone sub-modules in build_model
+        and are invoked via their compiled __call__ from this eager context.
+        This avoids graph-break / object-identity guard recompile storms caused
+        by PredMetrics.moe_lb_loss tensors crossing the disabled moe_losses()
+        boundary back into a compiled region (act.py:277 in satisfied-owl run).
         """
         # --- 1. Reset halted sequences ---
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
