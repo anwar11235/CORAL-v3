@@ -106,6 +106,9 @@ class TrainConfig(pydantic.BaseModel):
     lambda_moe_recon: float = 0.1         # weight for unweighted reconstruction loss
     lambda_moe_balance: float = 0.01      # weight for codebook load-balancing KL loss
 
+    # Eval
+    eval_max_examples: Optional[int] = None  # if set, stop eval after this many examples (per set)
+
     # Warm-start
     resume_from_checkpoint: Optional[str] = None  # path to a .pt state_dict to warm-start from
 
@@ -399,13 +402,20 @@ def evaluate(
         metric_keys: List[str] = []
         metric_values = None
         metric_gbs = [0] * len(set_ids)
+        examples_seen: dict = {k: 0 for k in set_ids}
 
         for set_name, batch, global_batch_size in eval_loader:
+            if (
+                config.eval_max_examples is not None
+                and examples_seen.get(set_name, 0) >= config.eval_max_examples
+            ):
+                continue  # keep iterating loader so it drains; skip compute
+
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = state.model.initial_carry(batch)  # type: ignore[operator]
 
-            # Run all halt_max_steps segments
+            # Run until Q-halt (q_halt > q_continue) or halt_max_steps.
             while True:
                 carry, _, metrics, _, all_done = state.model(  # type: ignore[operator]
                     carry=carry, batch=batch, return_keys=[]
@@ -413,6 +423,7 @@ def evaluate(
                 if all_done:
                     break
 
+            examples_seen[set_name] = examples_seen.get(set_name, 0) + global_batch_size
             sid = set_ids[set_name]
             if metric_values is None:
                 metric_keys = sorted(metrics.keys())
