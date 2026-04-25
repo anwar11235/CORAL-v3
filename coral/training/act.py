@@ -5,7 +5,7 @@ CoralACT wraps CoralInner and manages:
   - Carry reset for halted sequences (swap in fresh batch data)
   - Halting decisions: Q-learning with exploration during training
   - Bootstrapped target Q-values via an extra inner forward pass
-  - Eval mode: Q-halt (q_halt > q_continue) OR halt_max_steps, no exploration
+  - Eval mode: always runs halt_max_steps (no early stopping)
 
 Data flow:
     ACTLossHead.forward(carry, batch)
@@ -151,36 +151,35 @@ class CoralACT(nn.Module):
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
 
-            # Q-halt fires at both train and eval: stop when q_halt > q_continue.
-            # Train adds exploration (random min steps) and bootstrapping target Q.
-            # Eval uses Q-halt deterministically — no exploration, no extra forward.
+            # Default: halt only at max_steps (used during eval)
             halted = is_last_step
 
-            if self.config.halt_max_steps > 1:
+            if self.training and self.config.halt_max_steps > 1:
+                # Q-learning halt signal: halt when q_halt > q_continue
                 halted = halted | (q_halt_logits > q_continue_logits)
 
-                if self.training:
-                    # Exploration: with prob halt_exploration_prob, enforce a random
-                    # minimum number of steps before allowing halting.
-                    exploration_mask = torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob
-                    min_halt_steps = exploration_mask.to(torch.int32) * torch.randint_like(
-                        new_steps, low=2, high=self.config.halt_max_steps + 1
-                    )
-                    halted = halted & (new_steps >= min_halt_steps)
+                # Exploration: with prob halt_exploration_prob, enforce a random
+                # minimum number of steps before allowing halting.
+                # min_halt_steps = 0 (not drawn) OR Uniform[2, halt_max_steps]
+                exploration_mask = torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob
+                min_halt_steps = exploration_mask.to(torch.int32) * torch.randint_like(
+                    new_steps, low=2, high=self.config.halt_max_steps + 1
+                )
+                halted = halted & (new_steps >= min_halt_steps)
 
-                    # --- 4. Bootstrap target Q for the continue action ---
-                    # Run an EXTRA inner forward (no grad) to get next-step Q values.
-                    # inner returns (new_carry, logits, (q_halt, q_continue)); we only need [-1].
-                    next_q_halt, next_q_continue = self.inner(new_inner_carry, new_current_data)[-1]
-                    # target_q_continue = sigmoid(q_halt) at last step, else sigmoid(max(q_halt, q_continue))
-                    target_q_continue = torch.sigmoid(
-                        torch.where(
-                            is_last_step,
-                            next_q_halt,
-                            torch.maximum(next_q_halt, next_q_continue),
-                        )
+                # --- 4. Bootstrap target Q for the continue action ---
+                # Run an EXTRA inner forward (no grad) to get next-step Q values.
+                # inner returns (new_carry, logits, (q_halt, q_continue)); we only need [-1].
+                next_q_halt, next_q_continue = self.inner(new_inner_carry, new_current_data)[-1]
+                # target_q_continue = sigmoid(q_halt) at last step, else sigmoid(max(q_halt, q_continue))
+                target_q_continue = torch.sigmoid(
+                    torch.where(
+                        is_last_step,
+                        next_q_halt,
+                        torch.maximum(next_q_halt, next_q_continue),
                     )
-                    outputs["target_q_continue"] = target_q_continue
+                )
+                outputs["target_q_continue"] = target_q_continue
 
         new_carry = ACTCarry(
             inner_carry=new_inner_carry,
@@ -337,32 +336,28 @@ class CoralV3ACT(nn.Module):
         with torch.no_grad():
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
-
-            # Q-halt fires at both train and eval: stop when q_halt > q_continue.
-            # Train adds exploration and bootstrapping; eval is deterministic Q-halt only.
             halted = is_last_step
 
-            if self.config.halt_max_steps > 1:
+            if self.training and self.config.halt_max_steps > 1:
                 halted = halted | (q_halt_logits > q_continue_logits)
 
-                if self.training:
-                    exploration_mask = torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob
-                    min_halt_steps = exploration_mask.to(torch.int32) * torch.randint_like(
-                        new_steps, low=2, high=self.config.halt_max_steps + 1
-                    )
-                    halted = halted & (new_steps >= min_halt_steps)
+                exploration_mask = torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob
+                min_halt_steps = exploration_mask.to(torch.int32) * torch.randint_like(
+                    new_steps, low=2, high=self.config.halt_max_steps + 1
+                )
+                halted = halted & (new_steps >= min_halt_steps)
 
-                    # --- 4. Bootstrap target Q ---
-                    # Take index 2 explicitly — inner may return 3 or 4 values.
-                    next_q_halt, next_q_continue = self.inner(new_inner_carry, new_current_data)[2]
-                    target_q_continue = torch.sigmoid(
-                        torch.where(
-                            is_last_step,
-                            next_q_halt,
-                            torch.maximum(next_q_halt, next_q_continue),
-                        )
+                # --- 4. Bootstrap target Q ---
+                # Take index 2 explicitly — inner may return 3 or 4 values.
+                next_q_halt, next_q_continue = self.inner(new_inner_carry, new_current_data)[2]
+                target_q_continue = torch.sigmoid(
+                    torch.where(
+                        is_last_step,
+                        next_q_halt,
+                        torch.maximum(next_q_halt, next_q_continue),
                     )
-                    outputs["target_q_continue"] = target_q_continue
+                )
+                outputs["target_q_continue"] = target_q_continue
 
         new_carry = ACTCarry(
             inner_carry=new_inner_carry,

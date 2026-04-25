@@ -55,6 +55,11 @@ lr_min_ratio: 0.1
 global_batch_size: 384
 epochs: 20000
 eval_interval: 2000
+# Eval subsampling (Fix D): evaluate on first 10K test examples per call instead of
+# the full ~300K augmented test set.  Reduces per-eval time from ~14 min to ~30 sec.
+# Full evaluation (all augmented variants) is out-of-scope for this config; run
+# separately on the final checkpoint if exact full-set metrics are needed.
+eval_max_examples: 10000
 
 # --- Warm-start ---
 # Upload phase1_best_checkpoint_61pct.pt to /workspace/checkpoints/ before launching.

@@ -1,6 +1,6 @@
 # Eval Slowness Diagnosis
 
-**Branch:** moe-lb-specialization-compile-fix (HEAD 4017506)  
+**Branch:** moe-lb-specialization-compile-fix  
 **Date:** 2026-04-25  
 **Observed:** ~14 min per eval call across all Phase 3 runs, 10 calls per run → ~2h21m of 5h15m total consumed by eval  
 
@@ -36,7 +36,7 @@ In training mode, `halted = is_last_step | (q_halt > q_continue)`, so sequences 
 
 The eval `while True` loop in `train.py:409-413` only exits when `all_done = new_carry.halted.all()`, which under forced halting is True only after step 16.
 
-**Per-batch multiplier: 16 forward calls instead of ~3-6.**
+**Per-batch multiplier: 16 forward calls instead of ~3-6 (if Q-halt were active).**
 
 ---
 
@@ -67,21 +67,45 @@ This is consistent with the dataset name `sudoku-extreme-1k-aug-1000`.
 ## 4. Combined Effect
 
 ```
-Current: 784 batches × 16 forced segments × 0.067 s/segment = 840 s ✓ (matches observed 14 min)
+Baseline (observed): 784 batches × 16 forced segments × 0.067 s/segment = 840 s ✓
 
-Fix A alone (Q-halt, assume avg halt at step 4):
-  784 batches × 4 avg segments × 0.067 s = 210 s ≈ 3.5 min per eval
-  Speedup vs current: ~4×
-
-Fix A + D (eval_max_examples=10000, avg halt at step 4):
-  26 batches × 4 avg segments × 0.067 s = 7 s per eval
-  Speedup vs current: ~120×
-  Accuracy noise: ~2-3% std on exact_match estimated from 10K subsample vs 300K full
+Fix D only (eval_max_examples=10000, 16 forced segments):
+  26 batches × 16 segments × 0.067 s = 27.8 s ≈ 30 sec per eval
+  Speedup vs current: ~30×
+  Accuracy noise: ~2-3% std on exact_match from 10K subsample vs 300K full
+  Accuracy risk: ZERO — pure subsampling, no model behaviour change
 ```
 
 ---
 
-## 5. What Was Ruled Out
+## 5. Fix A: Q-halt at Eval — Attempted and Reverted
+
+**Commit shipped:** `7eaaf8e`  
+**Reverted in:** next commit  
+**Validation result:** `eval/exact_accuracy = 0.0` on `phase3c_option_y_step52080.pt`
+(vs 67.62% correct on the same checkpoint with forced halt_max_steps)
+
+**Root cause of regression:** The Q-halt head (`q_head = CastedLinear(hidden_size, 2)`) is
+trained under an exploration-active regime where `halt_exploration_prob=0.1` forces random
+minimum halt depths. The resulting Q-values reflect the exploration distribution, not
+greedy deterministic evaluation. Applied greedily at eval, `q_halt >> q_continue` fires at
+step 1 for nearly every sequence, halting before the model has had any chance to compute a
+meaningful answer. The prediction at step 1 is effectively random — hence 0% accuracy.
+
+**Why the original diagnosis was wrong:** The hypothesis "the halt policy is trained to halt
+when the answer is correct" assumed the Q-head is calibrated for greedy evaluation. It is
+not: the Q-head is calibrated for the exploration-mixed training distribution. Using it
+greedily at eval extrapolates outside its training distribution.
+
+**Fix A is designated future work.** Enabling Q-halt at eval requires retraining the Q-head
+with an eval-mode-aware reward signal (e.g., a separate eval Q-head trained without
+exploration, or a curriculum that anneals exploration to 0 near end of training). This is
+a non-trivial change to the training objective and out of scope for the current multi-seed
+campaign.
+
+---
+
+## 6. What Was Ruled Out
 
 **Hypothesis 3 (compile bypass):** `torch.compile` is applied at the sub-module level to `H_level` and `L_level` in `build_model()`. Sub-module compilation persists through `model.eval()` — the `OptimizedModule` wrapping is structural, not mode-dependent. No eval path change needed here.
 
@@ -91,10 +115,32 @@ Fix A + D (eval_max_examples=10000, avg halt at step 4):
 
 ---
 
-## 6. Recommended Fixes
+## 7. Shipped Fix: Fix D (eval_max_examples)
 
-**Fix A (primary, always apply):** Enable Q-halting at eval. Change the halting logic in `CoralACT.forward()` and `CoralV3ACT.forward()` so `q_halt > q_continue` can fire at eval just as in training — but WITHOUT exploration (no random min-halt-steps, no bootstrap target). Expected speedup 3-5× depending on the trained model's average halt step.
+**Status: ACTIVE** — deployed in `phase3c_moe_lb_specialization.yaml` as `eval_max_examples: 10000`.
 
-This changes eval behavior from "always 16 steps" to "halt when confident, max 16 steps." Accuracy impact: expected neutral to slightly positive (the halt policy is trained to fire when the answer is correct; forcing more steps just wastes compute on an already-confident model).
+Add `eval_max_examples: Optional[int]` to `TrainConfig`. If set, the `evaluate()` loop skips forward passes after the per-set budget is reached. Default: `None` = evaluate all examples (backward compatible with all prior configs).
 
-**Fix D (optional, strong recommendation for multi-seed campaigns):** Add `eval_max_examples: Optional[int]` config parameter. If set, the eval loop exits after processing that many examples. Setting `eval_max_examples=10000` reduces eval from ~300K to 10K examples — a 30× reduction — at the cost of stochastic accuracy noise on each eval call. The noise is well-bounded for monitoring purposes; a final end-of-training eval can still run on the full set.
+**Setting `eval_max_examples=10000`** evaluates the first 10K test examples per call:
+- ~26 batches × 16 forced segments × ~0.067s = **~28 seconds per eval** (vs 14 minutes)
+- **~30× speedup** with zero accuracy risk — pure subsampling, no model changes
+- Accuracy noise: bounded (≈ 2–3% std on exact_match from 10K vs 300K); adequate for
+  training-time monitoring; full evaluation can be run on the final checkpoint if needed
+
+---
+
+## 8. Future Work: Q-halt at Eval
+
+To enable early stopping at eval without accuracy regression, the Q-head must be trained
+to be calibrated for greedy evaluation. Options:
+
+1. **Exploration annealing**: decay `halt_exploration_prob` from 0.1 → 0 over training.
+   Near end of training the Q-head would be trained under near-greedy conditions.
+
+2. **Separate eval Q-head**: train a second Q-head under `model.eval()` conditions
+   (no exploration, no bootstrapping) as an auxiliary loss.
+
+3. **Threshold tuning**: keep Q-halt at eval but learn a per-step threshold (not just
+   `q_halt > q_continue`) that is calibrated against held-out performance.
+
+None of these is implemented. The multi-seed Phase 3c campaign proceeds with Fix D only.
