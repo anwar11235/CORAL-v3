@@ -32,6 +32,10 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
 
     sets: List[str]
 
+    # Provenance: seed used when the dataset was built. None means built before
+    # the determinism fix (pre-2026-04-25); treat those datasets as non-reproducible.
+    dataset_seed: Optional[int] = None
+
 
 def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     """8 dihedral symmetries by rotate, flip and mirror"""
