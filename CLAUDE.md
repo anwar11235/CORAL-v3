@@ -111,7 +111,13 @@ Baked-in fixes (as of 2026-04-20 rebuild):
 - pytest pre-installed
 - adam-atan2-pytorch==0.3.2 installed (fused CUDA path; avoids pure-PyTorch fallback)
 
-## Current State (Phases 0–3 complete; Phase 3a' complete — jovial-avocet 63.48%)
+## Current State (Phases 0–3c complete — 2026-04-25 EOD)
+
+> **⚠️ DATASET REPRODUCIBILITY WARNING (discovered 2026-04-25):** All CORAL training runs through Phase 3c used `build_sudoku_dataset.py` without seeding `np.random`. Every rebuild produces a different dataset realization. The Phase 3c checkpoint (`phase3c_option_y_step52080.pt`, 67.62%) was trained and evaluated on a dataset that was NOT archived and CANNOT be reconstructed. Cross-run accuracy comparisons (Phase 3a vs 3b vs 3c) are methodologically fragile because they were on different datasets. Fixed in branch `dataset-determinism-fix` (landed 2026-04-25): `--seed` flag, default `0`, recorded in `dataset.json`. All future training runs must use `--seed 0` for the canonical Sudoku-Extreme-1K reference dataset. See `docs/dataset_reproducibility.md`.
+
+> **2026-04-25 session fix branches (not yet merged to master):**
+> - `moe-lb-specialization-compile-fix`: sub-module compile fix (`6dcfc0f`), warm-start prefix remap (`4017506`), `eval_max_examples` config (`a96e499` after Fix A revert). See `docs/eval_slowness_diagnosis.md`.
+> - `dataset-determinism-fix`: dataset seeding fix (`9493d6d`). See `docs/dataset_reproducibility.md`.
 
 ```
 coral/
@@ -169,6 +175,8 @@ tests/
 
 ### Key Experimental Results
 
+⚠️ All runs below Phase 3c used non-reproducible datasets (unseeded `np.random`). Numbers are valid measurements on their original datasets but cannot be reproduced on a fresh build.
+
 | Run | W&B ID | Config | Final Accuracy | Status |
 |-----|--------|--------|----------------|--------|
 | calculating-caracara | kyi7327z | Baseline (pure PyTorch AdamATan2) | 41.2% | Complete |
@@ -178,6 +186,9 @@ tests/
 | agate-cuckoo | v7cmw24l | Phase 2 (routing only, λ_bal=0.01) | 7.3% at 10K | Killed — collapsed |
 | curly-manatee | — | Phase 2 (routing only, λ_bal=0.1) | 14.69% at 15K | Killed — collapsed |
 | **jovial-avocet** | **hb4bi1fu** | **Phase 3a' (PC + crystal warm-start)** | **63.48%** | **Complete ✓** |
+| **control-no-crystal** | **1h8cnlzb** | **Phase 3a control (no crystal)** | **65.58% @ step 41664** | **Complete ✓** |
+| **satisfied-owl** | **nt3iva8h** | **Phase 3b (Soft MoE, normalized L_lb)** | **66.05% @ step 52080** | **Complete ✓** |
+| **phase3c_option_y** | **voc0vjxs** | **Phase 3c (Option Y L_lb)** | **67.62% @ step 52080** | **Complete ✓ (non-reproducible)** |
 
 ### Phase 3a' — Completed (jovial-avocet, 2026-04-19)
 
@@ -187,12 +198,34 @@ Key findings:
 - +2.4pp over poetic-giraffe (61.07% → 63.48%) — attribution unresolved (warm-start vs. crystal aux loss)
 - Control run config ready (`configs/phase3a_control_warmstart.yaml` on `control-no-crystal`, commit `03d32b3`) — awaiting Vast launch to disambiguate
 
-### Phase 3b — Spec Revision 2 complete (2026-04-20); awaiting control result before implementation
+### Phase 3b — Complete (satisfied-owl, 2026-04-21)
 
-Architecture spec: `docs/CORAL_v3_Phase3b_MoE_Codebook_Spec.md` (branch: `moe-codebook-design`, commit `faf8664`)
-Design: Soft MoE Spatial Codebook — K=32 spatial codebook experts + 1 passthrough expert, softmax routing, no binary gate, reconstruction loss replaces BCE.
-Status: Spec finalized. Implementation blocked on control run result (decision gate §8/§9 Risk 1).
-Tightenings (2026-04-20): single-metric Euclidean k-means (Commit 3); hard 10× kill-threshold for L_recon (Risk 3); hard 1.5× action trigger for pred_error stratification (§4.1); stub columnar routing dispatch paths with NotImplementedError (Commit 4 + Risk 5 RESOLVED).
-Success criteria: exact_accuracy ≥ 0.65, mean_codebook_weight ≥ 0.15, codebook_utilization observational (K=32 for disambiguation), no eval checkpoint below 0.60.
+Architecture: Soft MoE Spatial Codebook — K=32 spatial experts + 1 passthrough, softmax routing, L_recon + normalized L_lb.
+Result: **66.05% peak @ step 52080** (+0.47pp vs control 65.58% — within seed variance).
+Diagnostic: router converged to near-uniform routing (mean_codebook_weight ≈ 0.025 ≈ 1/32). Normalized L_lb satisfied by uniform routing → no specialization pressure.
 
-See `PHASE3A_CHANGES.md` for launch commands and metric tracking guide.
+### Phase 3c — Complete (phase3c_option_y, 2026-04-24/25)
+
+Branch: `moe-lb-specialization` (HEAD `dbf21ea`).
+Config: `configs/phase3c_moe_lb_specialization.yaml`. Warm-start from `phase1_best_checkpoint_61pct.pt`.
+Result: **67.62% @ step 52080** (+1.57pp over satisfied-owl).
+Caveat: single seed, non-reproducible dataset. See dataset reproducibility warning above.
+Key change: L_lb Option Y — non-normalized KL over all K+1 experts, penalizing both passthrough dominance and uniform-codebook equilibrium.
+
+### 2026-04-25 session — Infrastructure fixes
+
+No new training data produced. Three fixes landed as branches:
+
+**`moe-lb-specialization-compile-fix`** (off `moe-lb-specialization`):
+- `6dcfc0f`: Sub-module compile fix — compile H_level/L_level independently to eliminate dynamo recompile storm (~7.48 → 1.08 it/s degradation in satisfied-owl)
+- `4017506`: Warm-start key remap — `_orig_mod.` prefix remapping for sub-module compiled models (was silently skipping all backbone weights at warm-start)
+- `a96e499`: Eval Fix D — `eval_max_examples` config param (14 min/eval → ~30 sec at 10K examples). Fix A (Q-halt at eval) attempted and reverted: Q-head trained under exploration-active regime gives 0% accuracy at greedy eval; future work. See `docs/eval_slowness_diagnosis.md`.
+
+**`dataset-determinism-fix`** (off `master`):
+- `9493d6d`: Seed all `np.random` calls in `build_sudoku_dataset.py` via `--seed` flag (default 0). Records seed in `dataset.json`. See `docs/dataset_reproducibility.md`.
+
+**Next steps (pending Anwar's decision):**
+1. Rebuild canonical Sudoku-Extreme-1K dataset with `--seed 0`; archive to durable storage
+2. Re-establish Phase 3a control, satisfied-owl, Phase 3c baselines on canonical dataset (~$10, ~12h)
+3. Multi-seed the winner of re-established baselines (~$15-20)
+4. Consider ARC adapter after Sudoku baselines confirmed
