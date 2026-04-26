@@ -9,6 +9,13 @@ Changes from upstream:
 - Added --coral-naming flag (default=True) that emits files with train__/test__
   prefixes and correct "sets" metadata directly, eliminating the post-build
   rename step. Pass --coral-naming=false to produce the original HRM-style output.
+- Added --seed flag for deterministic dataset construction (see DETERMINISM below).
+
+DETERMINISM: This script seeds all stochastic operations via the --seed flag.
+Two runs with the same --seed produce byte-identical output.
+The seed value is recorded in dataset.json under 'dataset_seed'.
+Changing the seed produces a completely different dataset; existing model
+checkpoints will not generalize across dataset realizations.
 """
 
 from typing import Optional
@@ -42,6 +49,7 @@ class DataProcessConfig(BaseModel):
     min_difficulty: Optional[int] = None
     num_aug: int = 0
     coral_naming: bool = True
+    seed: int = 0
 
 
 def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
@@ -165,6 +173,7 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         total_groups=len(results["group_indices"]) - 1,
         mean_puzzle_examples=1,
         sets=sets_label,
+        dataset_seed=config.seed,
     )
 
     # Save metadata as JSON.
@@ -185,6 +194,9 @@ def convert_subset(set_name: str, config: DataProcessConfig):
 
 @cli.command(singleton=True)
 def preprocess_data(config: DataProcessConfig):
+    # Seed ALL numpy random state before any stochastic operation.
+    # Must be the first statement — convert_subset calls np.random immediately.
+    np.random.seed(config.seed)
     convert_subset("train", config)
     convert_subset("test", config)
 
