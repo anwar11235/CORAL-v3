@@ -63,12 +63,12 @@ eval_max_examples: 10000
 
 # --- Warm-start ---
 # Upload phase1_best_checkpoint_61pct.pt to /workspace/checkpoints/ before launching.
-resume_from_checkpoint: "/workspace/checkpoints/phase1_best_checkpoint_61pct.pt"
+resume_from_checkpoint: "/workspace/checkpoints/phase1_canonical_seed0_best.pt"
 
 # --- Run management ---
-seed: 42
+seed: 0
 project_name: null   # auto: "Sudoku-extreme-1k-aug-1000 CORAL-v3"
-run_name: null       # auto-generated coolname for Phase 3c run
+run_name: "phase3c_canonical_seed0"
 checkpoint_path: null
 checkpoint_every_eval: false
 eval_save_outputs: []
