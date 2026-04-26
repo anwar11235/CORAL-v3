@@ -1,0 +1,25 @@
+﻿# configs/phase1.yaml
+# PC-only canonical Phase 1 baseline.
+# Reproduces poetic-giraffe (commit 5651f0a, 61.07% peak at step 52080) on canonical seed=0 dataset.
+#
+# Note: poetic-giraffe peaked at step 52080 on its (now-disposed) dataset. The new canonical run
+# may produce a similar but non-identical peak step and accuracy. Whatever this run produces
+# becomes the new canonical Phase 1 reference, and all subsequent Phase 3* warm-starts use the
+# resulting checkpoint.
+
+defaults:
+  - base
+  - _self_
+
+# Mechanism flags
+use_predictive_coding: true
+use_crystallization: false
+use_columnar_routing: false
+
+# PC weights (matched to poetic-giraffe)
+lambda_pred: 0.1
+lambda_pi: 0.01
+
+# Training length (matched to poetic-giraffe peak step)
+epochs: 20000
+eval_interval: 2000
