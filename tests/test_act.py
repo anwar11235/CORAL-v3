@@ -319,3 +319,160 @@ class TestACTLossHead:
         _, _, _, detached, _ = head(carry=carry, batch=batch, return_keys=["logits"])
         assert "logits" in detached
         assert detached["logits"].grad_fn is None
+
+
+# ---------------------------------------------------------------------------
+# Eval Q-halt behavior tests (CPU — Fix A regression coverage)
+# ---------------------------------------------------------------------------
+
+
+CPU_CFG = CoralConfig(
+    batch_size=BATCH,
+    seq_len=SEQ_LEN,
+    vocab_size=VOCAB,
+    H_cycles=1,
+    L_cycles=1,
+    H_layers=1,
+    L_layers=1,
+    hidden_size=16,
+    num_heads=2,
+    expansion=2.0,
+    halt_max_steps=8,
+    halt_exploration_prob=0.1,
+    forward_dtype="float32",
+    puzzle_emb_ndim=0,
+)
+
+
+class TestEvalHalting:
+    """Regression tests for eval halting behaviour.
+
+    Fix A (Q-halt active at eval) was validated on phase3c_option_y_step52080.pt and
+    produced 0% exact_accuracy — the trained Q-head halts too aggressively in greedy
+    eval mode because it was trained under exploration-active conditions.  Fix A was
+    reverted; eval reverts to halt_max_steps-only halting.  These tests guard that
+    reversion and document the expected invariants.
+
+    All tests run on CPU (no CUDA / flash_attn required).
+    """
+
+    def _make_cpu_act(self, halt_max_steps=8):
+        cfg = CPU_CFG.model_copy(update={"halt_max_steps": halt_max_steps})
+        return CoralACT(cfg)
+
+    def _make_batch_cpu(self):
+        return make_batch(B=BATCH, seq=SEQ_LEN, vocab=VOCAB, device="cpu")
+
+    def _bias_for_early_halt(self, model: CoralACT) -> None:
+        """Set q_head so q_halt >> q_continue — would trigger Q-halt if active."""
+        with torch.no_grad():
+            model.inner.q_head.bias[0] = 10.0   # q_halt
+            model.inner.q_head.bias[1] = -10.0  # q_continue
+
+    def _bias_for_late_halt(self, model: CoralACT) -> None:
+        """Set q_head so q_halt << q_continue — Q-halt never fires regardless."""
+        with torch.no_grad():
+            model.inner.q_head.bias[0] = -10.0  # q_halt
+            model.inner.q_head.bias[1] = 10.0   # q_continue
+
+    def test_eval_ignores_q_halt_signal(self):
+        """At eval, Q-halt does NOT fire even when q_halt >> q_continue.
+
+        Guard for Fix A revert: eval must always run halt_max_steps; the
+        Q-head trained under exploration-active regime is not calibrated for
+        greedy eval and halts too early (0% exact_accuracy on 3c checkpoint).
+        """
+        MAX_STEPS = 4
+        model = self._make_cpu_act(halt_max_steps=MAX_STEPS)
+        self._bias_for_early_halt(model)  # q_halt=10 >> q_continue=-10
+        model.eval()
+
+        batch = self._make_batch_cpu()
+        carry = model.initial_carry(batch)
+
+        # Steps 1 to MAX_STEPS-1: no halt expected even though q_halt >> q_continue
+        for step in range(1, MAX_STEPS):
+            carry, _ = model(carry, batch)
+            assert not carry.halted.any(), (
+                f"Eval should ignore Q-halt signal — unexpected halt at step {step} "
+                f"(q_halt >> q_continue but eval uses halt_max_steps={MAX_STEPS} only)"
+            )
+
+        # Step MAX_STEPS: is_last_step fires → all halt
+        carry, _ = model(carry, batch)
+        assert carry.halted.all(), (
+            f"All sequences should halt at halt_max_steps={MAX_STEPS}"
+        )
+
+    def test_eval_halts_at_max_steps_when_q_halt_never_fires(self):
+        """At eval, when q_halt < q_continue always, halt still occurs at halt_max_steps."""
+        MAX_STEPS = 4
+        model = self._make_cpu_act(halt_max_steps=MAX_STEPS)
+        self._bias_for_late_halt(model)
+        model.eval()
+
+        batch = self._make_batch_cpu()
+        carry = model.initial_carry(batch)
+
+        for step in range(1, MAX_STEPS):
+            carry, _ = model(carry, batch)
+            assert not carry.halted.any(), (
+                f"Unexpected halt at step {step}"
+            )
+
+        carry, _ = model(carry, batch)
+        assert carry.halted.all(), (
+            f"All sequences should halt at halt_max_steps={MAX_STEPS}"
+        )
+
+    def test_eval_no_bootstrap_target_in_outputs(self):
+        """At eval, target_q_continue must NOT appear (no extra inner forward)."""
+        model = self._make_cpu_act()
+        model.eval()
+        batch = self._make_batch_cpu()
+        carry = model.initial_carry(batch)
+        _, outputs = model(carry, batch)
+        assert "target_q_continue" not in outputs, (
+            "target_q_continue should only be computed during training (bootstrapping forward)"
+        )
+
+    def test_train_bootstrap_target_still_present(self):
+        """Training mode: target_q_continue must still appear (regression guard)."""
+        model = self._make_cpu_act()
+        model.train()
+        batch = self._make_batch_cpu()
+        carry = model.initial_carry(batch)
+        _, outputs = model(carry, batch)
+        assert "target_q_continue" in outputs, (
+            "target_q_continue must be present during training for bootstrapped Q-learning"
+        )
+
+    def test_eval_loop_runs_all_halt_max_steps(self):
+        """End-to-end eval loop: runs halt_max_steps iterations even with Q-halt bias.
+
+        Inverted from Fix A: eval no longer short-circuits via Q-halt, so the
+        while-loop-until-all_done always takes exactly halt_max_steps iterations.
+        """
+        from coral.training.losses import ACTLossHead
+
+        HALT_STEPS = 4
+        model = self._make_cpu_act(halt_max_steps=HALT_STEPS)
+        self._bias_for_early_halt(model)  # would trigger Q-halt if Fix A were active
+        head = ACTLossHead(model, loss_type="softmax_cross_entropy")
+        head.eval()
+
+        batch = self._make_batch_cpu()
+        carry = head.initial_carry(batch)
+
+        n_segments = 0
+        all_done = torch.tensor(False)
+        while not all_done:
+            carry, _, _, _, all_done = head(carry=carry, batch=batch, return_keys=[])
+            n_segments += 1
+            if n_segments > HALT_STEPS + 2:
+                break  # safety cap; should never trigger
+
+        assert n_segments == HALT_STEPS, (
+            f"Eval must run exactly halt_max_steps={HALT_STEPS} segments; "
+            f"ran {n_segments} (Q-halt should be inactive at eval)"
+        )

@@ -235,6 +235,7 @@ class CoralV3ACT(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 
+    @torch.compiler.disable(recursive=False)
     def forward(
         self,
         carry: ACTCarry,
@@ -253,6 +254,14 @@ class CoralV3ACT(nn.Module):
                 "pi_final"           — [B, seq_len, hidden_size] with grad
                 "pred_error_norm"    — scalar (mean over all steps, detached)
                 "precision_mean"     — scalar (mean over all steps, detached)
+
+        Note: @torch.compiler.disable prevents dynamo from tracing through this
+        function when the outer model is compiled.  The hot transformer kernels
+        (H_level, L_level) are compiled as standalone sub-modules in build_model
+        and are invoked via their compiled __call__ from this eager context.
+        This avoids graph-break / object-identity guard recompile storms caused
+        by PredMetrics.moe_lb_loss tensors crossing the disabled moe_losses()
+        boundary back into a compiled region (act.py:277 in satisfied-owl run).
         """
         # --- 1. Reset halted sequences ---
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -300,21 +309,28 @@ class CoralV3ACT(nn.Module):
             if pred_metrics.routing_logits_H is not None:
                 outputs["routing_logits_H"] = pred_metrics.routing_logits_H  # type: ignore[assignment]
                 outputs["routing_logits_L"] = pred_metrics.routing_logits_L  # type: ignore[assignment]
-            if pred_metrics.crystal_supervision_loss_final is not None:
-                outputs["crystal_supervision_loss_final"] = pred_metrics.crystal_supervision_loss_final  # type: ignore[assignment]
-            outputs["crystal_bypass_count"] = torch.tensor(
-                float(pred_metrics.crystal_bypass_count), device=logits.device
-            )
+            if pred_metrics.moe_recon_loss is not None:
+                outputs["moe_recon_loss"] = pred_metrics.moe_recon_loss  # type: ignore[assignment]
+            if pred_metrics.moe_lb_loss is not None:
+                outputs["moe_lb_loss"] = pred_metrics.moe_lb_loss        # type: ignore[assignment]
             if self.config.use_crystallization:
-                outputs["crystal_confidence_mean"] = torch.tensor(
-                    pred_metrics.crystal_confidence_mean,
+                outputs["moe_passthrough_weight"] = torch.tensor(
+                    pred_metrics.moe_passthrough_weight,
                     device=logits.device,
                     dtype=torch.float32,
                 )
-                if pred_metrics.crystal_reconstruction_error is not None:
-                    outputs["crystal_reconstruction_error"] = pred_metrics.crystal_reconstruction_error.to(logits.device)
-                if pred_metrics.crystal_target_confidence_mean is not None:
-                    outputs["crystal_target_confidence_mean"] = pred_metrics.crystal_target_confidence_mean.to(logits.device)
+                if pred_metrics.moe_routing_entropy is not None:
+                    outputs["moe_routing_entropy"] = torch.tensor(
+                        pred_metrics.moe_routing_entropy,
+                        device=logits.device,
+                        dtype=torch.float32,
+                    )
+                if pred_metrics.moe_codebook_util_frac is not None:
+                    outputs["moe_codebook_util_frac"] = torch.tensor(
+                        pred_metrics.moe_codebook_util_frac,
+                        device=logits.device,
+                        dtype=torch.float32,
+                    )
 
         # --- 3. Halting logic ---
         with torch.no_grad():

@@ -1,5 +1,5 @@
-"""Tests for Phase 3: RecognitionNetwork, CrystallizationBuffer,
-crystallization_supervision_loss, and CoralV3Inner with crystallization.
+"""Tests for Phase 3b: SpatialMoECodebook, CrystallizationBuffer, and CoralV3Inner
+with Soft MoE crystallization.
 
 Structural and shape tests run on CPU.
 CUDA-only tests require CUDA + flash_attn and are skipped when unavailable.
@@ -14,8 +14,7 @@ from coral.models.coral_base import CoralConfig, InnerCarry
 from coral.models.coral_v3 import CoralV3Inner, PredMetrics
 from coral.models.crystallization import (
     CrystallizationBuffer,
-    RecognitionNetwork,
-    crystallization_supervision_loss,
+    SpatialMoECodebook,
 )
 from coral.training.losses import load_balancing_loss
 
@@ -31,8 +30,7 @@ SEQ_LEN = 8
 BATCH = 4
 CODEBOOK_SIZE = 16
 PROJ_DIM = 32
-S = 4
-K = 2
+MOE_MODES = 8   # small K_modes for tests
 
 SMALL_CFG = dict(
     batch_size=BATCH,
@@ -59,15 +57,6 @@ CUDA_ONLY = pytest.mark.skipif(
 )
 
 
-def make_rnet() -> RecognitionNetwork:
-    return RecognitionNetwork(
-        h_dim=HIDDEN,
-        l_dim=HIDDEN,
-        codebook_size=CODEBOOK_SIZE,
-        proj_dim=PROJ_DIM,
-    )
-
-
 def make_batch(B=BATCH, seq=SEQ_LEN, vocab=VOCAB, device="cpu"):
     return {
         "inputs": torch.randint(0, vocab, (B, seq), device=device),
@@ -87,66 +76,140 @@ def make_v3_model(**overrides) -> CoralV3Inner:
 
 
 # ---------------------------------------------------------------------------
-# RecognitionNetwork
+# SpatialMoECodebook unit tests
 # ---------------------------------------------------------------------------
 
 
-def test_recognition_net_output_shapes():
-    rnet = make_rnet()
+def make_moe_codebook() -> SpatialMoECodebook:
+    cfg = CoralConfig(
+        batch_size=BATCH,
+        seq_len=SEQ_LEN,
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
+    )
+    return SpatialMoECodebook(cfg, seq_len=SEQ_LEN)
+
+
+def test_moe_codebook_forward_shapes():
+    mod = make_moe_codebook()
     z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
     z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    confidence, nearest_code, nearest_idx = rnet(z_H, z_L)
-    assert confidence.shape == (BATCH,), f"confidence: {confidence.shape}"
-    assert nearest_code.shape == (BATCH, SEQ_LEN, HIDDEN), f"nearest_code: {nearest_code.shape}"
-    assert nearest_idx.shape == (BATCH,), f"nearest_idx: {nearest_idx.shape}"
-
-
-def test_recognition_net_confidence_range():
-    """Confidence is a sigmoid output; must be in (0, 1)."""
-    rnet = make_rnet()
-    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    confidence, _, _ = rnet(z_H, z_L)
-    assert (confidence > 0).all() and (confidence < 1).all()
-
-
-def test_recognition_net_compute_key_shape():
-    rnet = make_rnet()
-    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    key = rnet.compute_key(z_H, z_L)
+    w, z_bypass, key = mod(z_H, z_L)
+    assert w.shape == (BATCH, MOE_MODES + 1)
+    assert z_bypass.shape == (BATCH, SEQ_LEN, HIDDEN)
     assert key.shape == (BATCH, PROJ_DIM * 2)
 
 
-def test_recognition_net_nearest_idx_valid():
-    """nearest_idx values must be in [0, codebook_size)."""
-    rnet = make_rnet()
+def test_moe_codebook_w_sums_to_one():
+    mod = make_moe_codebook()
     z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
     z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    _, _, nearest_idx = rnet(z_H, z_L)
-    assert (nearest_idx >= 0).all() and (nearest_idx < CODEBOOK_SIZE).all()
+    w, _, _ = mod(z_H, z_L)
+    torch.testing.assert_close(w.sum(dim=-1), torch.ones(BATCH), atol=1e-5, rtol=0)
 
 
-def test_recognition_net_nearest_code_expanded():
-    """nearest_code must be the codebook entry expanded to [B, seq, l_dim]."""
-    rnet = make_rnet()
+def test_moe_codebook_bootstrap_mask_forces_passthrough():
+    mod = make_moe_codebook()
+    mod.bootstrap_mask_router(True)
     z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
     z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    _, nearest_code, nearest_idx = rnet(z_H, z_L)
-    # All sequence positions for a given batch element should be the same codebook entry
-    for b in range(BATCH):
-        expected = rnet.codebook[nearest_idx[b]].unsqueeze(0).expand(SEQ_LEN, -1)
-        torch.testing.assert_close(nearest_code[b], expected)
+    w, z_bypass, _ = mod(z_H, z_L)
+    # w_pt = w[:, -1] should be 1.0 when bootstrap mask active
+    assert (w[:, -1] == 1.0).all(), "bootstrap mask should force w_pt=1.0"
+    # z_bypass should be zeros when bootstrap mask active
+    assert (z_bypass == 0.0).all()
 
 
-def test_recognition_net_differentiable():
-    rnet = make_rnet()
-    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN, requires_grad=True)
-    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN, requires_grad=True)
-    confidence, nearest_code, _ = rnet(z_H, z_L)
-    (confidence.sum() + nearest_code.sum()).backward()
-    assert z_H.grad is not None
-    assert z_L.grad is not None
+def test_moe_codebook_losses_shapes():
+    mod = make_moe_codebook()
+    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    w, z_bypass, _ = mod(z_H, z_L)
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    L_recon, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_recon.shape == ()
+    assert L_lb.shape == ()
+    assert L_recon.item() >= 0.0
+    assert L_lb.item() >= 0.0
+
+
+def test_moe_codebook_recon_loss_unweighted_gradient():
+    """codebook_values must always receive gradient from L_recon (unweighted)."""
+    mod = make_moe_codebook()
+    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    w, z_bypass, _ = mod(z_H, z_L)
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    L_recon, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    L_recon.backward()
+    # codebook_values must have a gradient regardless of router weights
+    assert mod.codebook_values.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# L_lb Option Y unit tests (Phase 3c)
+# ---------------------------------------------------------------------------
+
+
+def _make_w_from_probs(probs: list) -> torch.Tensor:
+    """Create a [1, len(probs)] w tensor from a list of probabilities."""
+    t = torch.tensor(probs, dtype=torch.float32).unsqueeze(0)
+    assert abs(t.sum().item() - 1.0) < 1e-5
+    return t
+
+
+def test_lb_option_y_zero_at_uniform():
+    """L_lb ≈ 0 when routing is uniform over K+1 experts."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    w = torch.full((BATCH, K + 1), 1.0 / (K + 1))
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() < 1e-5, f"L_lb should be ~0 at uniform K+1, got {L_lb.item()}"
+
+
+def test_lb_option_y_large_at_passthrough_dominance():
+    """L_lb is large and positive when all weight is on passthrough."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    # w_pt = 1, all codebook weights = 0
+    w = torch.zeros(BATCH, K + 1)
+    w[:, -1] = 1.0
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() > 0.5, f"L_lb should be large at passthrough dominance, got {L_lb.item()}"
+
+
+def test_lb_option_y_large_at_single_mode_dominance():
+    """L_lb is large and positive when all weight is on one codebook mode."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    w = torch.zeros(BATCH, K + 1)
+    w[:, 3] = 1.0  # single codebook mode
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() > 0.5, f"L_lb should be large at single-mode dominance, got {L_lb.item()}"
+
+
+def test_lb_option_y_nonzero_at_uniform_codebook_zero_passthrough():
+    """Uniform codebook with w_pt=0 is NOT uniform over K+1 → L_lb > 0."""
+    mod = make_moe_codebook()
+    K = MOE_MODES
+    # w_pt = 0, uniform over K codebook modes (1/K each, not 1/(K+1))
+    w = torch.zeros(BATCH, K + 1)
+    w[:, :K] = 1.0 / K
+    z_L_final = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    z_bypass = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    _, L_lb = mod.moe_losses(z_L_final, w, z_bypass)
+    assert L_lb.item() > 1e-4, (
+        f"L_lb should be > 0 for uniform-codebook+zero-passthrough (not uniform over K+1), "
+        f"got {L_lb.item()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -192,29 +255,35 @@ def test_buffer_clear():
     assert buf.pointer == 0
 
 
-def test_buffer_consolidate_small_buffer():
-    """consolidate silently skips when buffer has < 100 entries."""
+def test_buffer_spatial_add_and_retrieve():
+    """Spatial z_L added to buffer should be stored on CPU."""
     buf = CrystallizationBuffer(capacity=100)
-    buf.add(torch.randn(BATCH, PROJ_DIM * 2), torch.randn(BATCH, HIDDEN))
-    rnet = RecognitionNetwork(HIDDEN, HIDDEN, codebook_size=CODEBOOK_SIZE, proj_dim=PROJ_DIM)
-    # Should not raise
-    buf.consolidate(rnet, num_iterations=2, device="cpu")
+    keys = torch.randn(BATCH, PROJ_DIM * 2)
+    values = torch.randn(BATCH, HIDDEN)
+    z_L_spatial = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+    buf.add(keys, values, z_L_spatial=z_L_spatial)
+    assert buf.spatial_buffer is not None
+    assert buf.spatial_buffer.device.type == "cpu"
+    assert buf.spatial_buffer.shape == (buf.capacity, SEQ_LEN, HIDDEN)
 
 
-def test_buffer_consolidate_updates_codebook():
-    """After consolidation with enough data, codebook should change from initial values."""
-    rnet = RecognitionNetwork(HIDDEN, HIDDEN, codebook_size=8, proj_dim=PROJ_DIM)
-    buf = CrystallizationBuffer(capacity=1000)
-    # Fill buffer with 200 pairs
+def test_buffer_consolidate_spatial_basic():
+    """consolidate_spatial returns centroids of correct shape."""
+    capacity = 200
+    k_modes = 4
+    buf = CrystallizationBuffer(capacity=capacity)
     for _ in range(50):
-        buf.add(torch.randn(4, PROJ_DIM * 2), torch.randn(4, HIDDEN))
-
-    codebook_before = rnet.codebook.data.clone()
-    buf.consolidate(rnet, num_iterations=5, device="cpu")
-
-    # At least some codebook entries should have changed
-    changed = (rnet.codebook.data != codebook_before).any(dim=-1)
-    assert changed.any(), "Expected some codebook entries to be updated"
+        z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
+        buf.add(
+            torch.randn(BATCH, PROJ_DIM * 2),
+            torch.randn(BATCH, HIDDEN),
+            z_L_spatial=z_L,
+        )
+    result = buf.consolidate_spatial(k_modes=k_modes, num_iterations=3)
+    assert result is not None
+    centroids, utilization = result
+    assert centroids.shape == (k_modes, SEQ_LEN, HIDDEN)
+    assert 0 <= utilization <= k_modes
 
 
 def test_buffer_fill_progression():
@@ -235,39 +304,18 @@ def test_buffer_ring_semantics():
     buf = CrystallizationBuffer(capacity=capacity)
     key_dim = PROJ_DIM * 2
 
-    # Fill to saturation
     fill_keys = torch.arange(capacity * key_dim, dtype=torch.float32).reshape(capacity, key_dim)
     buf.add(fill_keys[:4], torch.zeros(4, HIDDEN))
     buf.add(fill_keys[4:8], torch.zeros(4, HIDDEN))
     buf.add(fill_keys[8:], torch.zeros(2, HIDDEN))
     assert len(buf) == capacity
 
-    # Add K=3 new items — they should overwrite slots 0,1,2
     new_keys = torch.full((3, key_dim), 999.0)
     buf.add(new_keys, torch.zeros(3, HIDDEN))
-    assert len(buf) == capacity  # still capped
-
-    # Slots 0,1,2 should now hold the new values
-    torch.testing.assert_close(buf.keys[:3], new_keys)
-    # Slots 3..9 should still hold the old values
-    torch.testing.assert_close(buf.keys[3:], fill_keys[3:])
-
-
-def test_buffer_consolidate_after_wrap():
-    """consolidate() works correctly after the ring buffer has wrapped around."""
-    rnet = RecognitionNetwork(HIDDEN, HIDDEN, codebook_size=8, proj_dim=PROJ_DIM)
-    capacity = 200
-    buf = CrystallizationBuffer(capacity=capacity)
-
-    # Overfill to force wraparound (300 items into capacity 200)
-    for _ in range(75):
-        buf.add(torch.randn(4, PROJ_DIM * 2), torch.randn(4, HIDDEN))
-
     assert len(buf) == capacity
-    # consolidate should complete without error and return a utilisation fraction
-    util = buf.consolidate(rnet, num_iterations=5, device="cpu")
-    assert util is not None
-    assert 0.0 <= util <= 1.0
+
+    torch.testing.assert_close(buf.keys[:3], new_keys)
+    torch.testing.assert_close(buf.keys[3:], fill_keys[3:])
 
 
 def test_buffer_single_large_add():
@@ -280,8 +328,6 @@ def test_buffer_single_large_add():
     buf.add(keys, values)
 
     assert len(buf) == capacity
-    # Implementation clips to last capacity rows (keys[5000:15000]) starting at pointer=0,
-    # so after the write pointer wraps back to 0.
     assert buf.pointer == 0
     torch.testing.assert_close(buf.keys, keys[B - capacity :])
 
@@ -294,7 +340,6 @@ def test_buffer_add_throughput():
     keys = torch.randn(384, 256, device="cuda")
     values = torch.randn(384, 512, device="cuda")
 
-    # Warmup (pre-saturation)
     for _ in range(5):
         buffer.add(keys, values)
     torch.cuda.synchronize()
@@ -306,7 +351,6 @@ def test_buffer_add_throughput():
     torch.cuda.synchronize()
     t_empty = (time.perf_counter() - start_empty) / 50
 
-    # Buffer is now saturated; measure post-saturation throughput
     torch.cuda.synchronize()
     start_full = time.perf_counter()
     for _ in range(50):
@@ -314,70 +358,10 @@ def test_buffer_add_throughput():
     torch.cuda.synchronize()
     t_full = (time.perf_counter() - start_full) / 50
 
-    # Absolute ceiling: a healthy add() should be well under 2ms; training steps are 160-300ms
-    # so add() at <2ms is <1.5% overhead per step. Ratio comparisons at sub-ms scale are noise.
     assert t_full < 0.002, (
         f"Buffer add() post-saturation too slow: "
         f"pre={t_empty * 1000:.2f}ms, post={t_full * 1000:.2f}ms (ceiling: 2.00ms)"
     )
-
-
-# ---------------------------------------------------------------------------
-# crystallization_supervision_loss
-# ---------------------------------------------------------------------------
-
-
-def test_crystal_supervision_loss_returns_scalar():
-    rnet = make_rnet()
-    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    loss, mean_recon, target_conf = crystallization_supervision_loss(rnet, z_H, z_L)
-    assert loss.shape == (), f"expected scalar bce_loss, got {loss.shape}"
-    assert mean_recon.shape == (), f"expected scalar mean_recon_error, got {mean_recon.shape}"
-    assert target_conf.shape == (), f"expected scalar target_conf_mean, got {target_conf.shape}"
-    # Diagnostics must be detached
-    assert not mean_recon.requires_grad
-    assert not target_conf.requires_grad
-
-
-def test_crystal_supervision_loss_bounded():
-    """BCE output is always >= 0."""
-    rnet = make_rnet()
-    for _ in range(5):
-        z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-        z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-        loss, _, _ = crystallization_supervision_loss(rnet, z_H, z_L)
-        assert loss.item() >= 0.0
-
-
-def test_crystal_supervision_loss_differentiable():
-    rnet = make_rnet()
-    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-    z_L = torch.randn(BATCH, SEQ_LEN, HIDDEN, requires_grad=True)
-    loss, _, _ = crystallization_supervision_loss(rnet, z_H, z_L)
-    loss.backward()
-    # Gradient should flow through confidence head (z_H, z_L → key → confidence)
-    assert z_L.grad is not None
-
-
-def test_crystal_supervision_loss_perfect_codebook():
-    """If nearest_code == z_L_converged (error = 0 < tolerance), target = 1."""
-    rnet = make_rnet()
-    z_H = torch.randn(BATCH, SEQ_LEN, HIDDEN)
-
-    # Force z_L to exactly match the first codebook entry
-    z_L = rnet.codebook[0].unsqueeze(0).unsqueeze(0).expand(BATCH, SEQ_LEN, -1).clone()
-
-    # Override codebook_keys so entry 0 always wins
-    with torch.no_grad():
-        rnet.codebook_keys.fill_(0.0)
-        rnet.codebook_keys[0].fill_(1.0)
-
-    loss, mean_recon, target_conf = crystallization_supervision_loss(rnet, z_H, z_L, tolerance=0.1)
-    # Confidence starts ~0.5 (random init), target = 1.0 → BCE ≈ 0.69
-    assert loss.item() >= 0.0
-    # With perfect codebook: reconstruction error ≈ 0, target_confidence ≈ 1
-    assert target_conf.item() >= 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -392,115 +376,107 @@ def test_no_crystal_returns_3tuple():
     assert len(result) == 3
 
 
-def test_crystal_only_returns_4tuple():
+def test_pc_with_crystal_returns_4tuple():
+    """use_predictive_coding=True + use_crystallization=True → 4-tuple."""
     model = make_v3_model(
+        use_predictive_coding=True,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
     )
     carry = make_inner_carry(model)
     result = model(carry, make_batch())
     assert len(result) == 4
 
 
+def test_pc_only_returns_4tuple():
+    """use_predictive_coding=True alone → 4-tuple."""
+    model = make_v3_model(use_predictive_coding=True)
+    carry = make_inner_carry(model)
+    result = model(carry, make_batch())
+    assert len(result) == 4
+
+
+def test_unsupported_dispatch_raises():
+    """Paths that require columnar routing raise NotImplementedError."""
+    model = make_v3_model(use_columnar_routing=True, num_columns=4, active_columns=2)
+    carry = make_inner_carry(model)
+    with pytest.raises(NotImplementedError):
+        model(carry, make_batch())
+
+
 # ---------------------------------------------------------------------------
-# CoralV3Inner — training mode: no bypass, buffer records states
+# CoralV3Inner — training mode: buffer records states
 # ---------------------------------------------------------------------------
 
 
-def test_crystal_training_no_bypass():
-    """During training, crystal_bypass_count must always be 0."""
+def test_crystal_training_moe_losses_during_bootstrap():
+    """During bootstrap, moe_recon_loss and moe_lb_loss should be None."""
     model = make_v3_model(
+        use_predictive_coding=True,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
-        crystal_confidence_threshold=0.0,  # would bypass immediately if eval
+        moe_num_modes=MOE_MODES,
+        crystal_bootstrap_steps=5000,  # bootstrap active
     )
     model.train()
     carry = make_inner_carry(model)
-    _, _, _, pred_metrics = model(carry, make_batch())
-    assert pred_metrics.crystal_bypass_count == 0
+    _, _, _, pm = model(carry, make_batch())
+    assert pm.moe_recon_loss is None, "bootstrap active — MoE losses should be None"
+    assert pm.moe_lb_loss is None
+    assert pm.moe_passthrough_weight == 1.0, "passthrough weight should be 1.0 during bootstrap"
+
+
+def test_crystal_training_moe_losses_post_bootstrap():
+    """With bootstrap_steps=0, MoE losses are computed immediately."""
+    model = make_v3_model(
+        use_predictive_coding=True,
+        use_crystallization=True,
+        crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
+        crystal_bootstrap_steps=0,  # no bootstrap
+    )
+    model.train()
+    carry = make_inner_carry(model)
+    _, _, _, pm = model(carry, make_batch())
+    assert pm.moe_recon_loss is not None, "no bootstrap — MoE recon loss should be computed"
+    assert pm.moe_lb_loss is not None
+    assert pm.moe_recon_loss.shape == ()
+    assert pm.moe_lb_loss.shape == ()
+    assert 0.0 <= pm.moe_passthrough_weight <= 1.0
 
 
 def test_crystal_training_buffer_records():
-    """After training forward pass, crystal buffer should contain entries."""
+    """After training forward pass with is_last_segment=True, buffer should have entries."""
     model = make_v3_model(
+        use_predictive_coding=True,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
     )
     model.train()
     carry = make_inner_carry(model)
-    # is_last_segment=True simulates the final ACT segment; recording is gated on this flag
     model(carry, make_batch(), is_last_segment=True)
     # H_cycles=2 → 1 non-last H cycle → 1 recording (B=4 entries)
     assert len(model.crystal_buffer) > 0
 
 
-def test_crystal_training_supervision_loss_computed():
-    """crystal_supervision_loss_final is non-None only after the gate is activated."""
-    # With bootstrap_steps=5000 (default), gate starts inactive → loss is None during bootstrap
-    model_bootstrap = make_v3_model(
+def test_crystal_eval_moe_losses_recon_only():
+    """In eval mode, L_recon is computed (for logging) but L_lb is None (no grad needed)."""
+    model = make_v3_model(
+        use_predictive_coding=True,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
-    )
-    model_bootstrap.train()
-    carry = make_inner_carry(model_bootstrap)
-    _, _, _, pm_bootstrap = model_bootstrap(carry, make_batch())
-    assert pm_bootstrap.crystal_supervision_loss_final is None, (
-        "gate inactive during bootstrap — BCE loss should be None"
-    )
-    # Diagnostics should still be computed even during bootstrap
-    assert pm_bootstrap.crystal_reconstruction_error is not None
-    assert pm_bootstrap.crystal_target_confidence_mean is not None
-
-    # With bootstrap_steps=0, gate is active from the start → loss is non-None
-    model_active = make_v3_model(
-        use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
-        crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
         crystal_bootstrap_steps=0,
     )
-    model_active.train()
-    carry2 = make_inner_carry(model_active)
-    _, _, _, pm_active = model_active(carry2, make_batch())
-    assert pm_active.crystal_supervision_loss_final is not None
-    assert pm_active.crystal_supervision_loss_final.shape == ()
-
-
-# ---------------------------------------------------------------------------
-# CoralV3Inner — eval mode: no bypass when confidence is below threshold
-# ---------------------------------------------------------------------------
-
-
-def test_crystal_eval_no_bypass_default_threshold():
-    """With default threshold (0.8) and random init, confidence ≈ 0.5 → no bypass."""
-    model = make_v3_model(
-        use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
-        crystal_proj_dim=PROJ_DIM,
-        crystal_confidence_threshold=0.8,
-    )
     model.eval()
     carry = make_inner_carry(model)
     with torch.no_grad():
-        _, _, _, pred_metrics = model(carry, make_batch())
-    assert pred_metrics.crystal_bypass_count == 0
-
-
-def test_crystal_eval_supervision_loss_none():
-    """In eval mode, crystal_supervision_loss_final should be None."""
-    model = make_v3_model(
-        use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
-        crystal_proj_dim=PROJ_DIM,
-    )
-    model.eval()
-    carry = make_inner_carry(model)
-    with torch.no_grad():
-        _, _, _, pred_metrics = model(carry, make_batch())
-    assert pred_metrics.crystal_supervision_loss_final is None
+        _, _, _, pm = model(carry, make_batch())
+    assert pm.moe_recon_loss is not None, "eval should compute L_recon for logging"
+    assert not pm.moe_recon_loss.requires_grad, "eval L_recon must be detached"
+    assert pm.moe_lb_loss is None, "L_lb not needed in eval"
 
 
 # ---------------------------------------------------------------------------
@@ -510,22 +486,21 @@ def test_crystal_eval_supervision_loss_none():
 
 def test_consolidate_codebook_clears_buffer():
     model = make_v3_model(
+        use_predictive_coding=True,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
     )
     model.train()
-    # Run enough passes to fill buffer beyond 100 entries threshold
     carry = make_inner_carry(model, B=32)
     for _ in range(10):
-        model(carry, make_batch(B=32))
+        model(carry, make_batch(B=32), is_last_segment=True)
 
     initial_len = len(model.crystal_buffer)
-    if initial_len >= 100:
-        model.consolidate_codebook()
+    if initial_len >= MOE_MODES:
+        result = model.consolidate_codebook()
         assert len(model.crystal_buffer) == 0
     else:
-        # Buffer < 100 — consolidate skips, then we call clear manually
         model.crystal_buffer.clear()
         assert len(model.crystal_buffer) == 0
 
@@ -535,111 +510,55 @@ def test_consolidate_codebook_noop_when_disabled():
     model.consolidate_codebook()  # Should not raise
 
 
-# ---------------------------------------------------------------------------
-# All four mechanism combinations
-# ---------------------------------------------------------------------------
-
-
-def _run_forward(model, train_mode):
-    if train_mode:
-        model.train()
-    else:
-        model.eval()
-    carry = make_inner_carry(model)
-    with torch.set_grad_enabled(train_mode):
-        return model(carry, make_batch())
-
-
-@pytest.mark.parametrize("pc,cr,cry", [
-    (False, False, False),  # baseline
-    (True,  False, False),  # PC only
-    (False, True,  False),  # routing only
-    (False, False, True),   # crystal only
-    (True,  True,  True),   # all three
-])
-def test_all_combinations_output_shapes(pc, cr, cry):
+def test_consolidate_codebook_updates_codebook_values():
+    """After consolidation with enough spatial data, codebook_values should change."""
     model = make_v3_model(
-        use_predictive_coding=pc,
-        use_columnar_routing=cr,
-        num_columns=S,
-        active_columns=K,
-        use_crystallization=cry,
-        codebook_size=CODEBOOK_SIZE,
-        crystal_proj_dim=PROJ_DIM,
-    )
-    result = _run_forward(model, train_mode=True)
-
-    expected_len = 3 if (not pc and not cr and not cry) else 4
-    assert len(result) == expected_len
-
-    if expected_len == 3:
-        new_carry, output, (q_halt, q_cont) = result
-    else:
-        new_carry, output, (q_halt, q_cont), pred_metrics = result
-
-    assert output.shape == (BATCH, SEQ_LEN, VOCAB)
-    assert q_halt.shape == (BATCH,)
-    assert q_cont.shape == (BATCH,)
-
-
-@pytest.mark.parametrize("pc,cr,cry", [
-    (True,  False, False),
-    (False, True,  False),
-    (False, False, True),
-    (True,  True,  True),
-])
-def test_all_combinations_pred_metrics_fields(pc, cr, cry):
-    model = make_v3_model(
-        use_predictive_coding=pc,
-        use_columnar_routing=cr,
-        num_columns=S,
-        active_columns=K,
-        use_crystallization=cry,
-        codebook_size=CODEBOOK_SIZE,
-        crystal_proj_dim=PROJ_DIM,
-    )
-    _, _, _, pred_metrics = _run_forward(model, train_mode=True)
-
-    if pc:
-        assert pred_metrics.epsilon_final is not None
-        assert pred_metrics.pi_final is not None
-    else:
-        assert pred_metrics.epsilon_final is None
-        assert pred_metrics.pi_final is None
-
-    if cr:
-        assert pred_metrics.routing_logits_H is not None
-        assert pred_metrics.routing_logits_L is not None
-    else:
-        assert pred_metrics.routing_logits_H is None
-        assert pred_metrics.routing_logits_L is None
-
-    if cry:
-        # Gate inactive by default (bootstrap_steps=5000): diagnostics present, BCE None.
-        # Use bootstrap_steps=0 to exercise the BCE path.
-        assert pred_metrics.crystal_reconstruction_error is not None
-        assert pred_metrics.crystal_target_confidence_mean is not None
-    else:
-        assert pred_metrics.crystal_supervision_loss_final is None
-        assert pred_metrics.crystal_reconstruction_error is None
-        assert pred_metrics.crystal_target_confidence_mean is None
-
-
-def test_load_balancing_loss_with_crystal():
-    """load_balancing_loss should still work correctly when crystallization is also active."""
-    model = make_v3_model(
-        use_columnar_routing=True,
-        num_columns=S,
-        active_columns=K,
+        use_predictive_coding=True,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
+        crystal_bootstrap_steps=5000,
     )
-    _, _, _, pred_metrics = _run_forward(model, train_mode=True)
-    all_logits = pred_metrics.routing_logits_H + pred_metrics.routing_logits_L
-    loss = load_balancing_loss(all_logits, S)
-    assert loss.shape == ()
-    assert loss.item() >= 0.0
+    model.train()
+    carry = make_inner_carry(model, B=32)
+    # Run enough steps to fill the buffer with spatial z_L data
+    for _ in range(15):
+        model(carry, make_batch(B=32), is_last_segment=True)
+
+    initial_values = model.moe_codebook.codebook_values.data.clone()
+    if model.crystal_buffer.size >= MOE_MODES and model.crystal_buffer.spatial_buffer is not None:
+        result = model.consolidate_codebook()
+        if result is not None:
+            # Codebook values should differ from random init after k-means
+            changed = (model.moe_codebook.codebook_values.data != initial_values).any()
+            assert changed, "codebook_values should be updated after consolidation"
+            assert not model._crystal_bootstrap_active, "bootstrap should be deactivated"
+
+
+# ---------------------------------------------------------------------------
+# PredMetrics field checks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pc,cry", [
+    (True,  False),   # PC only
+    (True,  True),    # PC + crystal (bootstrap active)
+])
+def test_pred_metrics_pc_fields(pc, cry):
+    model = make_v3_model(
+        use_predictive_coding=pc,
+        use_crystallization=cry,
+        crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
+    )
+    carry = make_inner_carry(model)
+    model.train()
+    _, _, _, pm = model(carry, make_batch())
+
+    assert pm.epsilon_final is not None
+    assert pm.pi_final is not None
+    assert pm.routing_logits_H is None
+    assert pm.routing_logits_L is None
 
 
 # ---------------------------------------------------------------------------
@@ -649,44 +568,20 @@ def test_load_balancing_loss_with_crystal():
 
 @CUDA_ONLY
 def test_crystal_cuda_forward_backward():
-    """Full forward + backward with crystallization on CUDA."""
-    model = make_v3_model(
-        use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
-        crystal_proj_dim=PROJ_DIM,
-    ).cuda()
-    model.train()
-    carry = make_inner_carry(model, device="cuda")
-    batch = make_batch(device="cuda")
-    _, output, _, pred_metrics = model(carry, batch)
-    loss = output.sum() + pred_metrics.crystal_supervision_loss_final
-    loss.backward()
-    assert not output.isnan().any()
-    assert pred_metrics.crystal_supervision_loss_final.item() >= 0.0
-
-
-@CUDA_ONLY
-def test_all_three_mechanisms_cuda():
-    """All three mechanisms together on CUDA."""
+    """Full forward + backward with PC + crystallization on CUDA."""
     model = make_v3_model(
         use_predictive_coding=True,
-        use_columnar_routing=True,
-        num_columns=S,
-        active_columns=K,
         use_crystallization=True,
-        codebook_size=CODEBOOK_SIZE,
         crystal_proj_dim=PROJ_DIM,
+        moe_num_modes=MOE_MODES,
+        crystal_bootstrap_steps=0,  # activate codebook immediately
     ).cuda()
     model.train()
     carry = make_inner_carry(model, device="cuda")
     batch = make_batch(device="cuda")
-    _, output, _, pred_metrics = model(carry, batch)
-    loss = (
-        output.sum()
-        + pred_metrics.epsilon_final.sum()
-        + pred_metrics.crystal_supervision_loss_final
-    )
-    for lgt in pred_metrics.routing_logits_H + pred_metrics.routing_logits_L:
-        loss = loss + lgt.sum()
+    _, output, _, pm = model(carry, batch)
+    loss = output.sum()
+    if pm.moe_recon_loss is not None:
+        loss = loss + pm.moe_recon_loss
     loss.backward()
     assert not output.isnan().any()

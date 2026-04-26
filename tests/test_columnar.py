@@ -213,6 +213,7 @@ def make_v3_routing_model(cr=True, pc=False, cfg_overrides=None) -> CoralV3Inner
     return CoralV3Inner(CoralConfig(**cfg))
 
 
+@pytest.mark.skip(reason="columnar routing dispatch disabled in Phase 3b — pending redesign")
 def test_v3_routing_forward_shapes():
     model = make_v3_routing_model(cr=True, pc=False)
     carry = make_inner_carry(model)
@@ -225,6 +226,7 @@ def test_v3_routing_forward_shapes():
     assert q_cont.shape == (BATCH,)
 
 
+@pytest.mark.skip(reason="columnar routing dispatch disabled in Phase 3b — pending redesign")
 def test_v3_routing_pred_metrics_routing_logits():
     model = make_v3_routing_model(cr=True, pc=False)
     carry = make_inner_carry(model)
@@ -232,13 +234,13 @@ def test_v3_routing_pred_metrics_routing_logits():
     _, _, _, pred_metrics = model(carry, batch)
     assert pred_metrics.routing_logits_H is not None
     assert pred_metrics.routing_logits_L is not None
-    # H has H_layers=2 blocks, L has L_layers=2 blocks
     assert len(pred_metrics.routing_logits_H) == SMALL_CFG["H_layers"]
     assert len(pred_metrics.routing_logits_L) == SMALL_CFG["L_layers"]
     for lgt in pred_metrics.routing_logits_H + pred_metrics.routing_logits_L:
         assert lgt.shape == (BATCH, S)
 
 
+@pytest.mark.skip(reason="columnar routing dispatch disabled in Phase 3b — pending redesign")
 def test_v3_routing_no_pc_outputs():
     """With cr=True, pc=False: epsilon_final and pi_final should be None."""
     model = make_v3_routing_model(cr=True, pc=False)
@@ -256,6 +258,7 @@ def test_v3_no_routing_baseline():
     assert len(result) == 3, "expected 3-tuple for baseline (no routing, no PC)"
 
 
+@pytest.mark.skip(reason="columnar routing dispatch disabled in Phase 3b — pending redesign")
 def test_v3_routing_and_pc_combined():
     """cr=True and pc=True together: all fields populated."""
     model = make_v3_routing_model(cr=True, pc=True)
@@ -304,6 +307,7 @@ def test_columnar_block_cuda_forward_backward():
 
 
 @CUDA_ONLY
+@pytest.mark.skip(reason="columnar routing dispatch disabled in Phase 3b — pending redesign")
 def test_v3_routing_cuda_forward_backward():
     model = make_v3_routing_model(cr=True, pc=False).cuda()
     carry = make_inner_carry(model, device="cuda")
@@ -313,11 +317,11 @@ def test_v3_routing_cuda_forward_backward():
     for lgt in pred_metrics.routing_logits_H + pred_metrics.routing_logits_L:
         loss = loss + lgt.sum()
     loss.backward()
-    # Basic sanity: no NaNs in output
     assert not output.isnan().any()
 
 
 @CUDA_ONLY
+@pytest.mark.skip(reason="columnar routing dispatch disabled in Phase 3b — pending redesign")
 def test_v3_routing_and_pc_cuda():
     """Combined PC + routing forward + backward on CUDA."""
     model = make_v3_routing_model(cr=True, pc=True).cuda()

@@ -76,13 +76,16 @@ class CoralConfig(BaseModel):
 
     # Phase 3: recognition-gated crystallization
     use_crystallization: bool = False
-    codebook_size: int = 256              # K — number of codebook entries
-    crystal_proj_dim: int = 128           # projection dim for recognition key
-    crystal_confidence_threshold: float = 0.8  # bypass fires when mean(confidence) > threshold
-    crystal_buffer_capacity: int = 10000  # ring-buffer capacity for consolidation
-    crystal_consolidation_interval: int = 10   # epochs between consolidation calls
-    crystal_bootstrap_steps: int = 5000    # steps before first consolidation / gate supervision
-    lambda_crystal: float = 0.1           # weight for crystallization supervision loss
+    codebook_size: int = 256              # K — pooled codebook entries (kept for CrystallizationBuffer key init)
+    crystal_proj_dim: int = 128           # projection dim for recognition key (proj_h, proj_l)
+    crystal_buffer_capacity: int = 10000  # ring-buffer capacity for spatial k-means bootstrap
+    crystal_consolidation_interval: int = 10   # steps between consolidation calls
+    crystal_bootstrap_steps: int = 5000    # steps before first spatial k-means consolidation
+
+    # Phase 3b: Soft MoE spatial codebook
+    moe_num_modes: int = 32              # K_modes — number of spatial codebook experts
+    lambda_moe_recon: float = 0.1        # weight for reconstruction loss (unweighted L_recon)
+    lambda_moe_balance: float = 0.01     # weight for codebook load-balancing KL loss
 
 
 # ---------------------------------------------------------------------------

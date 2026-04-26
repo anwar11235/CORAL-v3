@@ -95,15 +95,19 @@ class TrainConfig(pydantic.BaseModel):
     column_warmup_steps: int = 10000  # steps to anneal from start_k → active_columns; 0 = skip
     column_warmup_start_k: int = 8    # k at step 0 (defaults to S = num_columns)
 
-    # Phase 3: recognition-gated crystallization
+    # Phase 3b: Soft MoE Crystallization
     use_crystallization: bool = False
     codebook_size: int = 256
     crystal_proj_dim: int = 128
-    crystal_confidence_threshold: float = 0.8
     crystal_buffer_capacity: int = 10000
-    crystal_consolidation_interval: int = 5000  # steps between codebook consolidations; 0 = never
-    crystal_bootstrap_steps: int = 5000    # steps before first consolidation / gate supervision
-    lambda_crystal: float = 0.1
+    crystal_consolidation_interval: int = 5000  # steps between spatial k-means runs; 0 = never
+    crystal_bootstrap_steps: int = 5000    # steps before first k-means consolidation
+    moe_num_modes: int = 32               # K_modes — spatial codebook experts
+    lambda_moe_recon: float = 0.1         # weight for unweighted reconstruction loss
+    lambda_moe_balance: float = 0.01      # weight for codebook load-balancing KL loss
+
+    # Eval
+    eval_max_examples: Optional[int] = None  # if set, stop eval after this many examples (per set)
 
     # Warm-start
     resume_from_checkpoint: Optional[str] = None  # path to a .pt state_dict to warm-start from
@@ -180,15 +184,16 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
         num_columns=config.num_columns,
         active_columns=config.active_columns,
         lambda_balance=config.lambda_balance,
-        # Phase 3: crystallization
+        # Phase 3b: Soft MoE crystallization
         use_crystallization=config.use_crystallization,
         codebook_size=config.codebook_size,
         crystal_proj_dim=config.crystal_proj_dim,
-        crystal_confidence_threshold=config.crystal_confidence_threshold,
         crystal_buffer_capacity=config.crystal_buffer_capacity,
         crystal_consolidation_interval=config.crystal_consolidation_interval,
         crystal_bootstrap_steps=config.crystal_bootstrap_steps,
-        lambda_crystal=config.lambda_crystal,
+        moe_num_modes=config.moe_num_modes,
+        lambda_moe_recon=config.lambda_moe_recon,
+        lambda_moe_balance=config.lambda_moe_balance,
     )
 
     _any_v3 = config.use_predictive_coding or config.use_columnar_routing or config.use_crystallization
@@ -202,7 +207,20 @@ def build_model(config: TrainConfig, metadata: PuzzleDatasetMetadata, world_size
             model = ACTLossHead(inner_model, loss_type=config.loss_type)
 
         if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=config.use_columnar_routing)  # type: ignore[assignment]
+            if _any_v3:
+                # Compile only the hot transformer kernels (H_level, L_level) to avoid the
+                # graph-break recompile storm:  the disabled moe_losses() returns new scalar
+                # tensors each call; when the entire model is torch.compiled, dynamo resumes
+                # at act.py:277 and guards on PredMetrics.moe_lb_loss object identity —
+                # failing every call and hitting cache_size_limit=64.
+                # Compiling H_level / L_level as standalone sub-modules gives ~same speedup
+                # (they contain all the attention + FFN compute) while the outer ACT / loss
+                # code runs eagerly with no graph breaks.
+                _inner = inner_model.inner  # CoralV3Inner (inherits H_level, L_level from CoralInner)
+                _inner.H_level = torch.compile(_inner.H_level)  # type: ignore[assignment]
+                _inner.L_level = torch.compile(_inner.L_level)  # type: ignore[assignment]
+            else:
+                model = torch.compile(model, dynamic=config.use_columnar_routing)  # type: ignore[assignment]
 
         if world_size > 1:
             with torch.no_grad():
@@ -384,13 +402,20 @@ def evaluate(
         metric_keys: List[str] = []
         metric_values = None
         metric_gbs = [0] * len(set_ids)
+        examples_seen: dict = {k: 0 for k in set_ids}
 
         for set_name, batch, global_batch_size in eval_loader:
+            if (
+                config.eval_max_examples is not None
+                and examples_seen.get(set_name, 0) >= config.eval_max_examples
+            ):
+                continue  # keep iterating loader so it drains; skip compute
+
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = state.model.initial_carry(batch)  # type: ignore[operator]
 
-            # Run all halt_max_steps segments
+            # Run until Q-halt (q_halt > q_continue) or halt_max_steps.
             while True:
                 carry, _, metrics, _, all_done = state.model(  # type: ignore[operator]
                     carry=carry, batch=batch, return_keys=[]
@@ -398,6 +423,7 @@ def evaluate(
                 if all_done:
                     break
 
+            examples_seen[set_name] = examples_seen.get(set_name, 0) + global_batch_size
             sid = set_ids[set_name]
             if metric_values is None:
                 metric_keys = sorted(metrics.keys())
@@ -418,10 +444,9 @@ def evaluate(
                     m = {metric_keys[i]: mv[sid, i] for i in range(len(metric_keys))}
                     count = max(m.pop("count"), 1)
                     m = {k: v / count for k, v in m.items()}
-                    # Convert crystal_bypass_count → crystal_bypass_rate (eval only)
-                    if "crystal_bypass_count" in m:
-                        h_bypassable = max(config.H_cycles - 1, 1)
-                        m["crystal_bypass_rate"] = m.pop("crystal_bypass_count") / h_bypassable
+                    # Convert moe_passthrough_weight to codebook_weight for logging clarity
+                    if "crystal/mean_passthrough_weight" in m:
+                        m["crystal/mean_codebook_weight"] = 1.0 - m["crystal/mean_passthrough_weight"]
                     result[sname] = m
                 return result
 
@@ -486,6 +511,59 @@ def save_checkpoint(
 # ---------------------------------------------------------------------------
 
 
+def _remap_checkpoint_keys_for_submodule_compile(
+    ckpt: dict,
+    target_model: nn.Module,
+) -> tuple:
+    """Insert _orig_mod. into checkpoint keys where target_model has compiled sub-modules.
+
+    When torch.compile() is applied to individual sub-modules (Approach A), PyTorch
+    registers the original module under _orig_mod, which shifts parameter names:
+        model.inner.H_level.layers.0.weight
+        → model.inner.H_level._orig_mod.layers.0.weight
+
+    A checkpoint saved without sub-module compile (or with top-level compile,
+    after stripping the root prefix) has keys in the first form; this function
+    rewrites them to match the second form so load_state_dict finds the right keys.
+
+    Idempotent: keys that already have _orig_mod. at the boundary are left
+    unchanged, so checkpoints saved from sub-module-compiled models reload
+    without double-insertion.
+
+    Args:
+        ckpt:         Checkpoint key→tensor dict (top-level _orig_mod. already stripped).
+        target_model: The model about to receive the weights.
+
+    Returns:
+        (remapped_ckpt, affected_prefixes) — adjusted dict and list of sub-module
+        dot-prefixes where _orig_mod. was inserted (empty if no change needed).
+    """
+    compiled_prefixes: list = [
+        name + "."
+        for name, mod in target_model.named_modules()
+        if name and "_orig_mod" in {n for n, _ in mod.named_children()}
+    ]
+    if not compiled_prefixes:
+        return ckpt, []
+
+    # Longest-first so a nested compile matches the innermost boundary first.
+    compiled_prefixes.sort(key=len, reverse=True)
+
+    new_ckpt: dict = {}
+    remapped: set = set()
+    for k, v in ckpt.items():
+        new_k = k
+        for prefix in compiled_prefixes:
+            if k.startswith(prefix):
+                remainder = k[len(prefix):]
+                if not remainder.startswith("_orig_mod."):
+                    new_k = prefix + "_orig_mod." + remainder
+                    remapped.add(prefix)
+                break
+        new_ckpt[new_k] = v
+    return new_ckpt, sorted(remapped)
+
+
 def load_warmstart_checkpoint(
     state: TrainState,
     checkpoint_path: str,
@@ -496,13 +574,14 @@ def load_warmstart_checkpoint(
     Designed for cross-phase warm-starts (e.g., Phase 1 → Phase 3) where the
     source checkpoint does not contain crystallization module weights.  Uses
     strict=False so only the keys present in the checkpoint are loaded; new
-    modules (RecognitionNetwork, CrystallizationBuffer parameters) keep their
+    modules (SpatialMoECodebook, CrystallizationBuffer parameters) keep their
     random initialisation.
 
-    Handles torch.compile prefix mismatches on both sides: if either the
-    checkpoint or the current model was wrapped by torch.compile, keys are
-    normalised before load_state_dict so backbone weights match regardless
-    of compile state at save/load time.
+    Handles three torch.compile prefix patterns automatically:
+      1. Top-level compiled checkpoint (_orig_mod. at root) → sub-module compiled model:
+         strip root prefix, then insert _orig_mod. at H_level / L_level boundaries.
+      2. Uncompiled checkpoint → sub-module compiled model: insert sub-module prefixes.
+      3. Sub-module compiled checkpoint → sub-module compiled model: idempotent, no change.
 
     Optimizer state is NOT restored — optimizers always start fresh.  This is
     correct for cross-phase warm-starts where the parameter set has changed.
@@ -525,24 +604,37 @@ def load_warmstart_checkpoint(
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         ckpt = ckpt["model_state_dict"]
 
-    # Strip torch.compile "_orig_mod." prefix from checkpoint keys if present.
-    # Checkpoints saved from compiled models have this prefix; uncompiled
-    # models expect keys without it.
+    # Strip top-level torch.compile "_orig_mod." prefix.
+    # Checkpoints saved with torch.compile(whole_model) carry this prefix.
     if any(k.startswith("_orig_mod.") for k in ckpt.keys()):
         if rank == 0:
-            print("[CORAL-v3] Stripping '_orig_mod.' prefix from checkpoint keys (source was compiled)")
+            print("[CORAL-v3] Stripping root '_orig_mod.' prefix from checkpoint keys "
+                  "(source was top-level compiled)")
         ckpt = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
                 for k, v in ckpt.items()}
 
-    # Unwrap torch.compile on the target model side as well (defensive:
-    # works whether current model is compiled or not).
+    # Unwrap torch.compile on the target model side (defensive; handles the case
+    # where the whole model was compiled rather than individual sub-modules).
     target_model = state.model
     if hasattr(target_model, "_orig_mod"):
         target_model = target_model._orig_mod  # type: ignore[attr-defined]
 
+    # Insert _orig_mod. at sub-module compile boundaries.
+    # Under Approach A, H_level and L_level are compiled independently; their
+    # parameter keys gain a _orig_mod. segment that older checkpoints lack.
+    ckpt, remapped_prefixes = _remap_checkpoint_keys_for_submodule_compile(ckpt, target_model)
+    if rank == 0 and remapped_prefixes:
+        print(f"[CORAL-v3] Remapped checkpoint keys: inserted '_orig_mod.' at "
+              f"sub-module boundaries {remapped_prefixes}")
+
     result = target_model.load_state_dict(ckpt, strict=False)
 
     if rank == 0:
+        if result.missing_keys or result.unexpected_keys:
+            model_sample = sorted(target_model.state_dict().keys())[:5]
+            ckpt_sample = sorted(ckpt.keys())[:5]
+            print(f"[CORAL-v3] Model state_dict (first 5): {model_sample}")
+            print(f"[CORAL-v3] Checkpoint keys   (first 5): {ckpt_sample}")
         if result.missing_keys:
             print(
                 f"[CORAL-v3] Warm-start: {len(result.missing_keys)} keys not in checkpoint "
@@ -632,7 +724,7 @@ def main(hydra_config: DictConfig) -> None:
     state = init_train_state(config, train_meta, world_size=WORLD_SIZE)
 
     # Warm-start: load backbone weights from a prior-phase checkpoint.
-    # Missing keys (new modules like RecognitionNetwork) are expected and logged.
+    # Missing keys (new modules like SpatialMoECodebook) are expected and logged.
     if config.resume_from_checkpoint:
         state = load_warmstart_checkpoint(state, config.resume_from_checkpoint, RANK)
 
@@ -652,10 +744,10 @@ def main(hydra_config: DictConfig) -> None:
     latest_checkpoint_path: Optional[str] = None
 
     # Bootstrap-phase state — persists across eval checkpoints.
-    # first_consolidation_done tracks whether the first full-replace consolidation
-    # has succeeded; until then the crystal gate receives no BCE supervision.
+    # first_consolidation_done tracks whether the first spatial k-means consolidation
+    # has succeeded; until then the codebook mask is active (w_pt forced to 1.0).
     first_consolidation_done: bool = False
-    # When crystal_bootstrap_steps == 0 the gate is active from step 0 (backward compat).
+    # When crystal_bootstrap_steps == 0 consolidation is skipped entirely (immediate live).
     if config.use_crystallization and config.crystal_bootstrap_steps == 0:
         first_consolidation_done = True
 
@@ -699,15 +791,21 @@ def main(hydra_config: DictConfig) -> None:
                     is_first = not first_consolidation_done
                     usage = inner.consolidate_codebook(is_first_consolidation=is_first)
                     if RANK == 0:
-                        print(
-                            f"[CORAL-v3] Codebook consolidation at step {state.step}"
-                            f" (first={is_first}, usage={usage})"
-                        )
+                        if usage is None:
+                            print(
+                                f"[CORAL-v3] Consolidation skipped at step {state.step}: "
+                                f"buffer disabled post-bootstrap (backprop-only update path active)"
+                            )
+                        else:
+                            print(
+                                f"[CORAL-v3] Codebook consolidation at step {state.step}"
+                                f" (first={is_first}, usage={usage})"
+                            )
                     if usage is not None and not first_consolidation_done:
                         first_consolidation_done = True
-                        inner._crystal_gate_active = True
+                        # consolidate_codebook() already deactivates bootstrap mask internally
                         if RANK == 0:
-                            print("[CORAL-v3] Crystal gate activated — BCE supervision enabled.")
+                            print("[CORAL-v3] Spatial k-means consolidation done — MoE codebook live.")
                     if usage is not None and RANK == 0:
                         wandb.log(
                             {"train/crystal/codebook_utilisation_frac": usage},

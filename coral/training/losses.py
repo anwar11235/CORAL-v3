@@ -440,23 +440,32 @@ class CoralV3LossHead(nn.Module):
                 for col_idx in range(avg_probs.shape[0]):
                     metrics[f"col_{col_idx}_freq"] = avg_probs[col_idx]
 
-        # ---- Crystallization supervision loss (only during training when enabled) ----
-        crystal_loss = outputs.get("crystal_supervision_loss_final")
-        if crystal_loss is not None:
-            lambda_crystal = self.model.config.lambda_crystal  # type: ignore[attr-defined]
-            total_loss = total_loss + lambda_crystal * crystal_loss
-            metrics["crystal_supervision_loss"] = crystal_loss.detach()
+        # ---- MoE crystallization losses (Phase 3b/3c, post-bootstrap) ----
+        moe_recon_loss = outputs.get("moe_recon_loss")
+        moe_lb_loss = outputs.get("moe_lb_loss")
+        # L_recon is logged during both train and eval; L_lb only during train.
+        if moe_recon_loss is not None:
+            metrics["crystal/recon_loss"] = moe_recon_loss.detach()
+        if moe_recon_loss is not None and moe_lb_loss is not None:
+            cfg = self.model.config  # type: ignore[attr-defined]
+            total_loss = (
+                total_loss
+                + cfg.lambda_moe_recon * moe_recon_loss
+                + cfg.lambda_moe_balance * moe_lb_loss
+            )
+            metrics["crystal/lb_loss"] = moe_lb_loss.detach()
 
-        # Log crystal bypass count and any other crystal scalars
-        for key in (
-            "crystal_bypass_count",
-            "crystal_confidence_mean",
-            "crystal_reconstruction_error",
-            "crystal_target_confidence_mean",
-        ):
-            if key in outputs:
-                val = outputs[key]
-                metrics[key] = val.detach() if isinstance(val, torch.Tensor) else val
+        # Log MoE routing scalars
+        moe_pt = outputs.get("moe_passthrough_weight")
+        if moe_pt is not None:
+            metrics["crystal/mean_passthrough_weight"] = moe_pt.detach()
+            metrics["crystal/mean_codebook_weight"] = (1.0 - moe_pt).detach()
+        moe_entropy = outputs.get("moe_routing_entropy")
+        if moe_entropy is not None:
+            metrics["crystal/routing_entropy"] = moe_entropy.detach()
+        moe_util = outputs.get("moe_codebook_util_frac")
+        if moe_util is not None:
+            metrics["crystal/codebook_utilisation_frac"] = moe_util.detach()
 
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
