@@ -1,0 +1,29 @@
+﻿# configs/phase1_full_eval.yaml
+# One-shot full-eval pass on the canonical Phase 1 checkpoint.
+# Used to diagnose biased-eval impact: phase1_canonical_seed0 reported 56.34% on
+# the first 10K test examples (eval_max_examples=10000); this run measures
+# accuracy on the full ~300K augmented test set for an apples-to-apples comparison
+# with historical poetic-giraffe (61.07% full eval).
+#
+# Mechanics: warm-start from phase1_canonical_seed0_best.pt, train for 1 epoch
+# with lr=0 (weights don't update), trigger one eval at end of that epoch.
+# Eval runs on full test set (no eval_max_examples cap).
+
+defaults:
+  - phase1
+  - _self_
+
+# Warm-start from canonical Phase 1 best checkpoint
+resume_from_checkpoint: "/workspace/checkpoints/phase1_canonical_seed0_best.pt"
+
+# Training: 1 epoch with lr=0 means weights don't change, just trigger eval
+epochs: 1
+eval_interval: 1
+lr: 0.0
+puzzle_emb_lr: 0.0
+
+# Override Fix D — full eval on all ~300K augmented test examples
+eval_max_examples: 999999999
+
+# Run management
+run_name: "phase1_canonical_seed0_full_eval"
