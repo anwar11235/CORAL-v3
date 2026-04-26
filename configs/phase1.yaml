@@ -23,3 +23,6 @@ lambda_pi: 0.01
 # Training length (matched to poetic-giraffe peak step)
 epochs: 20000
 eval_interval: 2000
+
+# Eval subsampling (Fix D — caps eval at 10K examples for ~30s per eval call instead of ~14 min)
+eval_max_examples: 10000
