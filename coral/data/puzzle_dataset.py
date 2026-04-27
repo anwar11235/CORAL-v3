@@ -16,6 +16,7 @@ per step, pack into global_batch_size batches.
 Eval iteration: iterate all examples sequentially without shuffling.
 """
 
+import copy
 import json
 import os
 from typing import Iterator, List, Optional, Tuple
@@ -101,6 +102,48 @@ def _sample_batch(
         current_size += append_size
 
     return start_index, np.concatenate(batch), np.concatenate(batch_puzzle_indices)
+
+
+# ---------------------------------------------------------------------------
+# Lazy group ordering (O(N) memory streaming replacement for O(E×N) pre-alloc)
+# ---------------------------------------------------------------------------
+
+
+class _LazyGroupOrder:
+    """Lazy-replay concatenation of E shuffled epoch orderings.
+
+    The original _iter_train pre-allocated the full E×N group ordering with
+    np.concatenate, which OOMs at production scale (3.83M groups × 2000 epochs
+    ≈ 61 GB).  This class provides the same indexing contract as a flat numpy
+    array while materialising only one epoch's permutation at a time.
+
+    Byte-identical batches are guaranteed because:
+    - The epoch permutations are replayed from Philox states saved BEFORE the
+      pre-pass consumed them, so group ordering at index [e*N + i] is the same
+      value that np.concatenate would have put there.
+    - The sampling RNG (rng passed to _sample_batch) is advanced through all E
+      permutations first (pre-pass), so it sits at the same Philox state as in
+      the original code when the first sampling draw happens.
+    """
+
+    def __init__(self, epoch_perm_states: list, n_groups: int) -> None:
+        self._states = epoch_perm_states   # list of Philox state dicts, len == E
+        self._n = n_groups
+        self._current_epoch: int = -1
+        self._current_perm: Optional[np.ndarray] = None
+
+    @property
+    def size(self) -> int:
+        return len(self._states) * self._n
+
+    def __getitem__(self, idx: int) -> int:
+        epoch, pos = divmod(idx, self._n)
+        if epoch != self._current_epoch:
+            bg = np.random.Philox()
+            bg.state = copy.deepcopy(self._states[epoch])
+            self._current_perm = np.random.Generator(bg).permutation(self._n)
+            self._current_epoch = epoch
+        return self._current_perm[pos]  # type: ignore[index]
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +252,61 @@ class PuzzleDataset(IterableDataset):
 
                 start += self.config.global_batch_size
 
-    def _iter_train(self) -> Iterator:
+    def _iter_train_legacy(self) -> Iterator:
+        """Original O(E×N) implementation — preserved on branch for regression testing.
+        Remove after fix/dataloader-streaming-group-order is merged to master.
+        """
         for set_name, dataset in self._data.items():  # type: ignore[union-attr]
             self._iters += 1
             rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
 
-            # epochs_per_iter concatenated shuffled group orderings
             group_order = np.concatenate([
                 rng.permutation(dataset["group_indices"].size - 1)
                 for _ in range(self.config.epochs_per_iter)
             ])
+            start = 0
+
+            while start < group_order.size:
+                start, batch_indices, batch_puzzle_indices = _sample_batch(
+                    rng,
+                    group_order=group_order,
+                    puzzle_indices=dataset["puzzle_indices"],
+                    group_indices=dataset["group_indices"],
+                    start_index=start,
+                    global_batch_size=self.config.global_batch_size,
+                )
+
+                effective_bs = batch_puzzle_indices.size
+                if effective_bs < self.config.global_batch_size:
+                    break
+
+                r = self.config.rank
+                bs = self.local_batch_size
+                yield set_name, self._collate({
+                    "inputs": dataset["inputs"][batch_indices[r * bs:(r + 1) * bs]],
+                    "labels": dataset["labels"][batch_indices[r * bs:(r + 1) * bs]],
+                    "puzzle_identifiers": dataset["puzzle_identifiers"][
+                        batch_puzzle_indices[r * bs:(r + 1) * bs]
+                    ],
+                }), effective_bs
+
+    def _iter_train(self) -> Iterator:
+        for set_name, dataset in self._data.items():  # type: ignore[union-attr]
+            self._iters += 1
+            rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
+            n_groups = dataset["group_indices"].size - 1
+
+            # Pre-pass: advance the Philox stream through all E permutations in the
+            # same order as before, saving the state before each.  The sampling RNG
+            # therefore sits at the same post-permutation state as the original code,
+            # guaranteeing byte-identical batches.  Peak memory: O(E) state dicts
+            # (~128 bytes each) instead of O(E×N) array elements.
+            epoch_perm_states = []
+            for _ in range(self.config.epochs_per_iter):
+                epoch_perm_states.append(rng.bit_generator.state)
+                rng.permutation(n_groups)  # advance RNG; discard result
+
+            group_order = _LazyGroupOrder(epoch_perm_states, n_groups)
             start = 0
 
             while start < group_order.size:
