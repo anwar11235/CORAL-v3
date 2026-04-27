@@ -108,6 +108,12 @@ class TrainConfig(pydantic.BaseModel):
 
     # Eval
     eval_max_examples: Optional[int] = None  # if set, stop eval after this many examples (per set)
+    # eval_halt_mode controls how ACT halts during evaluation:
+    #   "max_steps" (default): run every example to halt_max_steps (current behaviour)
+    #   "greedy":              halt each example when Q-halt > Q-continue; the first
+    #                          segment where the Q-head votes to stop is treated as the
+    #                          terminal segment, and per-example segment counts are logged.
+    eval_halt_mode: str = "max_steps"
 
     # Warm-start
     resume_from_checkpoint: Optional[str] = None  # path to a .pt state_dict to warm-start from
@@ -451,6 +457,132 @@ def evaluate(
                 return result
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Greedy-halt evaluation
+# ---------------------------------------------------------------------------
+
+
+def evaluate_greedy_halt(
+    config: TrainConfig,
+    state: TrainState,
+    eval_loader: DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+) -> Optional[dict]:
+    """Eval pass that halts each example when Q-halt > Q-continue (greedy inference).
+
+    Unlike the standard evaluate(), this function calls act.inner directly for
+    each ACT segment instead of calling the loss head.  This bypasses ACT's
+    auto-injection of the next training example for halted positions, so every
+    test-set example is processed exactly once and stops at the first segment
+    where the Q-halt head votes to stop (or at halt_max_steps if it never does).
+
+    No eval_max_examples cap is applied — always evaluates the full dataset.
+
+    Returns (rank-0 only):
+        dict with keys:
+            "exact_accuracy"              -- exact-match accuracy at greedy halt
+            "mean_halt_segments_greedy"   -- mean ACT segments used per example
+            "p50_halt_segments_greedy"    -- 50th-percentile segments
+            "p90_halt_segments_greedy"    -- 90th-percentile segments
+            "halt_rate_greedy"            -- fraction halted before halt_max_steps
+        Returns None on non-zero ranks.
+    """
+    from coral.training.act import CoralV3ACT
+    from coral.training.losses import IGNORE_LABEL_ID
+
+    act = state.model.model          # CoralACT or CoralV3ACT
+    inner = act.inner                # CoralInner or CoralV3Inner
+    is_v3 = isinstance(act, CoralV3ACT)
+
+    total_examples = 0
+    total_correct  = 0
+    all_segs: List[int] = []
+
+    with torch.inference_mode():
+        for set_name, batch, global_batch_size in eval_loader:
+            batch  = {k: v.cuda() for k, v in batch.items()}
+            labels = batch["labels"]                       # [B, seq_len]
+            bs     = labels.shape[0]
+            device = labels.device
+
+            # Fresh inner carry — equivalent to ACT's first-call reset.
+            inner_carry = inner.empty_carry(bs, device=device)
+
+            # Per-example tracking (all on GPU for speed; moved to CPU at batch end)
+            done          = torch.zeros(bs, dtype=torch.bool,  device=device)
+            segs_at_halt  = torch.full((bs,), config.halt_max_steps,
+                                       dtype=torch.int32, device=device)
+            final_logits  = torch.zeros(bs, labels.shape[1],
+                                        inner.config.vocab_size,  # type: ignore[attr-defined]
+                                        dtype=torch.float32, device=device)
+
+            for seg in range(1, config.halt_max_steps + 1):
+                is_last = (seg == config.halt_max_steps)
+
+                if is_v3:
+                    result = inner(inner_carry, batch, is_last_segment=False)
+                else:
+                    result = inner(inner_carry, batch)
+
+                inner_carry, logits, (q_halt, q_continue) = result[0], result[1], result[2]
+
+                # Greedy halt decision for undone sequences
+                q_halt_fires = (q_halt > q_continue) & ~done
+                at_max_steps = is_last & ~done
+                newly_done   = q_halt_fires | at_max_steps
+
+                # Capture logits and segment count at the halt step
+                if newly_done.any():
+                    final_logits[newly_done] = logits[newly_done].float()
+                    segs_at_halt[newly_done] = seg
+
+                done = done | newly_done
+                if done.all():
+                    break
+
+            # Accuracy: only for examples with at least one non-ignored label token
+            mask         = labels != IGNORE_LABEL_ID            # [B, seq_len]
+            has_labels   = mask.any(dim=-1)                     # [B]
+            preds        = final_logits.argmax(dim=-1)          # [B, seq_len]
+            seq_correct  = ((preds == labels) | ~mask).all(-1)  # [B]
+
+            valid_count    = has_labels.sum().item()
+            correct_count  = (seq_correct & has_labels).sum().item()
+
+            total_examples += valid_count
+            total_correct  += correct_count
+            all_segs.extend(segs_at_halt[has_labels].cpu().tolist())
+
+    if world_size > 1:
+        # Aggregate across ranks
+        counts_t = torch.tensor(
+            [total_examples, total_correct], dtype=torch.float64, device="cuda"
+        )
+        dist.all_reduce(counts_t)
+        total_examples = int(counts_t[0].item())
+        total_correct  = int(counts_t[1].item())
+        # NOTE: all_segs distribution is not reduced across ranks — logged from rank 0 only.
+        # For single-GPU eval runs this is fine; multi-GPU eval would under-count the
+        # distribution but total_examples / accuracy are still correct.
+
+    if rank != 0:
+        return None
+
+    segs_t = torch.tensor(all_segs, dtype=torch.float32)
+    n      = max(len(all_segs), 1)
+
+    return {
+        "exact_accuracy":             total_correct / max(total_examples, 1),
+        "mean_halt_segments_greedy":  segs_t.mean().item(),
+        "p50_halt_segments_greedy":   segs_t.quantile(0.50).item(),
+        "p90_halt_segments_greedy":   segs_t.quantile(0.90).item(),
+        "halt_rate_greedy":           (segs_t < config.halt_max_steps).float().mean().item(),
+        "n_examples_greedy":          n,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +957,17 @@ def main(hydra_config: DictConfig) -> None:
                 for k, v in primary.items():
                     flat[f"eval/{k}"] = v
             wandb.log(flat, step=state.step)
+
+        # ---- Greedy-halt eval (optional) ----
+        if config.eval_halt_mode == "greedy":
+            greedy_metrics = evaluate_greedy_halt(
+                config, state, eval_loader, eval_meta, rank=RANK, world_size=WORLD_SIZE
+            )
+            if RANK == 0 and greedy_metrics:
+                wandb.log(
+                    {f"eval/greedy/{k}": v for k, v in greedy_metrics.items()},
+                    step=state.step,
+                )
 
         # ---- Checkpoint ----
         if RANK == 0 and eval_metrics:

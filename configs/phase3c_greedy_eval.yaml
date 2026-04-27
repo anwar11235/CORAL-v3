@@ -1,0 +1,30 @@
+# configs/phase3c_greedy_eval.yaml
+# Greedy-halt evaluation on the canonical Phase 3c best checkpoint.
+#
+# Purpose: measure per-example ACT segment usage under deterministic
+# (greedy Q-halt) inference for the Phase 3c (PC + MoE crystal) model.
+# This is the primary data for the compounding-inference-efficiency claim.
+#
+# Checkpoint: phase3c_canonical_seed0_best.pt (68.74% exact accuracy)
+# Dataset:    canonical seed=0 Sudoku-Extreme-1K (full test set, no cap)
+
+defaults:
+  - phase3c_moe_lb_specialization
+  - _self_
+
+# Warm-start from Phase 3c best checkpoint
+resume_from_checkpoint: "/workspace/checkpoints/phase3c_canonical_seed0_best.pt"
+
+# Eval-only: 1 epoch, no weight updates
+epochs: 1
+eval_interval: 1
+lr: 0.0
+puzzle_emb_lr: 0.0
+
+# Greedy halt: measure Q-halt-based segment usage
+eval_halt_mode: greedy
+
+# Full test set — no subsampling
+eval_max_examples: null
+
+run_name: "phase3c_canonical_greedy_eval"

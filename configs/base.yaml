@@ -45,3 +45,7 @@ run_name: null                 # W&B run name (auto-generated if null)
 checkpoint_path: null          # Save checkpoints here (auto-generated if null)
 checkpoint_every_eval: false
 eval_save_outputs: []
+
+# Eval halt mode: "max_steps" (default, run every example to halt_max_steps)
+# or "greedy" (halt each example when Q-halt > Q-continue; logs segment distribution).
+eval_halt_mode: max_steps
