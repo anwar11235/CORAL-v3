@@ -1,0 +1,24 @@
+# configs/phase1_corrected.yaml
+# Corrected canonical Phase 1 re-run.
+#
+# Purpose: isolate the puzzle-embedding hyperparameter drift between
+#   poetic-giraffe (mfno8t1y, 61.07%) and phase1_canonical_seed0 (o7vph4ze, 56.34%).
+#
+# Config diff that motivated this run (both values were in base.yaml, not overridden
+# by phase1.yaml, and therefore inherited unchanged into phase1_canonical_seed0):
+#
+#   puzzle_emb_lr:          base=1e-3  (canonical)  ->  7e-5  (poetic-giraffe match)
+#   puzzle_emb_weight_decay: base=0.1  (canonical)  ->  1.0   (poetic-giraffe match)
+#
+# All other values are identical to phase1.yaml (and therefore to phase1_canonical_seed0).
+# Dataset: canonical seed=0 Sudoku-Extreme-1K (same as phase1_canonical_seed0).
+
+defaults:
+  - phase1
+  - _self_
+
+# Revert puzzle-embedding hyperparameter drift to match poetic-giraffe
+puzzle_emb_lr: 7.0e-5
+puzzle_emb_weight_decay: 1.0
+
+run_name: phase1_canonical_seed0_corrected
